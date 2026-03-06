@@ -125,7 +125,7 @@ function buildQaSystemPrompt(
     const workDir = sandbox?.workDir ?? MONOREPO_ROOT;
 
     const urlSection = isSandboxMode
-        ? 'SANDBOX MODE: No live service is available. Validate via build/compile checks only.'
+        ? 'SANDBOX MODE: The sandbox dev server is accessible via mapped ports. You MUST probe the live endpoints.'
         : liveUrlHint !== null
             ? `Live service base URL to probe: ${liveUrlHint}`
             : 'No explicit service URL. Probe http://localhost:3001 (backend) or http://localhost:3000 (frontend) based on what files were changed.';
@@ -163,16 +163,26 @@ Use standard localhost URLs (e.g. http://localhost:3001) — they are automatica
 Run the TypeScript compiler to verify the code compiles without errors:
   execute_cli_command: "cd ${workDir} && pnpm build 2>&1 | tail -30"
 
-### 2. Probe live endpoints (if applicable)
-If the SWE started a dev server, probe it:
-${sandboxBackendPort !== undefined ? `  - Backend: http_get { "url": "http://localhost:3001/health" }` : '  - Backend port not mapped'}
+### 2. Start the dev server if not already running
+Check whether a dev server is running by probing the frontend/backend ports.
+If connection refused, start the dev server inside the container:
+  execute_cli_command: "cd ${workDir} && pnpm --filter @ai-hivemind/web dev &"
+Wait a few seconds, then re-probe.
+
+### 3. Probe live endpoints (REQUIRED when ports are mapped)
+You MUST probe the sandbox dev server to verify the feature works end-to-end:
 ${sandboxFrontendPort !== undefined ? `  - Frontend: http_get { "url": "http://localhost:3000" }` : '  - Frontend port not mapped'}
-If connection refused, the SWE did not start a server — fall back to compile checks only.
+${sandboxBackendPort !== undefined ? `  - Backend: http_get { "url": "http://localhost:3001/health" }` : '  - Backend port not mapped'}
+If there are new pages or API routes in the changed files, probe those specific paths too.
+FAIL if: connection refused after starting the dev server, HTTP 4xx/5xx, or the page shows an error state.
 
-### 3. Validate response content (if service is reachable)
-Same as non-sandbox mode: check HTTP status, response content, acceptance criteria.
+### 4. Validate response content
+Check the HTTP response body matches acceptance criteria:
+  - HTML pages must NOT contain error messages like "Error loading", "fetch failed", "Something went wrong"
+  - API responses must return expected data structure with non-empty content
+  - Required UI elements or data must be present in the response
 
-### 4. Final verdict
+### 5. Final verdict
 Emit your verdict as JSON (NO tool calls after this):
 {
   "passed": true | false,
@@ -182,11 +192,11 @@ Emit your verdict as JSON (NO tool calls after this):
 }
 
 RULES:
-- PASS requires: TypeScript compilation succeeds. If a service is reachable, HTTP 2xx + correct content.
-- FAIL if: compile errors, required files not changed, acceptance criteria clearly not met
-- If no server is running, a successful compile is sufficient for PASS
+- PASS requires: TypeScript compilation succeeds AND live endpoint returns HTTP 2xx with correct content
+- FAIL if: compile errors, HTTP errors, error messages in rendered page, empty data, acceptance criteria not met
+- A successful compile alone is NOT sufficient for PASS — you MUST verify the feature works via HTTP
 - Do NOT fail for: missing Playwright (no browser in container), minor cosmetic issues
-- issues must be specific and actionable — include file paths, error messages, and what you expected`;
+- issues must be specific and actionable — include file paths, error messages, URLs probed, and what you expected`;
     }
 
     return `You are the QA Engineer agent in an autonomous software engineering swarm.
