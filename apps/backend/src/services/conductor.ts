@@ -125,6 +125,9 @@ export class ConductorWrapper {
     /** Ports that have already had SERVICE_DEPLOYED emitted */
     seenPorts = new Set<number>();
 
+    /** Active sandbox handle (when running in Docker isolation) */
+    #sandbox: SandboxHandle | undefined;
+
     /** stdin bridge cleanup handle */
     unsubscribeIntervention: (() => void) | null = null;
 
@@ -157,6 +160,7 @@ export class ConductorWrapper {
         this.objective = prompt;
         this.#sawResult = false;
         this.messageBuffer = '';
+        this.#sandbox = sandbox;
 
         return new Promise<void>((resolve, reject) => {
             let settled = false;
@@ -562,6 +566,14 @@ export class ConductorWrapper {
         this.messageBuffer = '';
     }
 
+    /** Rewrite a container-internal URL to the host-accessible URL using the port map. */
+    #rewriteUrl(url: string, containerPort: number): string {
+        if (this.#sandbox === undefined) return url;
+        const hostPort = this.#sandbox.portMap[containerPort];
+        if (hostPort === undefined) return url;
+        return url.replace(`:${containerPort.toString()}`, `:${hostPort.toString()}`);
+    }
+
     detectDevServer(stderr: string): void {
         const re = /https?:\/\/(localhost|127\.0\.0\.1):(\d+)/g;
         let match: RegExpExecArray | null;
@@ -569,7 +581,7 @@ export class ConductorWrapper {
             const port = parseInt(match[2] ?? '0', 10);
             if (port > 0 && !this.seenPorts.has(port)) {
                 this.seenPorts.add(port);
-                const url = match[0];
+                const url = this.#rewriteUrl(match[0], port);
                 const serviceName = `dev-server-${port.toString()}`;
                 this.emit('SERVICE_DEPLOYED', { serviceName, url, port });
             }
@@ -580,7 +592,8 @@ export class ConductorWrapper {
             const port = parseInt(stdoutMatch[2] ?? '0', 10);
             if (port > 0 && !this.seenPorts.has(port)) {
                 this.seenPorts.add(port);
-                this.emit('SERVICE_DEPLOYED', { serviceName: `dev-server-${port.toString()}`, url: stdoutMatch[0], port });
+                const url = this.#rewriteUrl(stdoutMatch[0], port);
+                this.emit('SERVICE_DEPLOYED', { serviceName: `dev-server-${port.toString()}`, url, port });
             }
         }
     }
