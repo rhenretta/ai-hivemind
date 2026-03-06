@@ -2,13 +2,14 @@ import { EventEmitter } from 'node:events';
 
 import { type SystemEvent } from '@ai-hivemind/shared';
 
+import { appendEvent, getAllEvents, getLedgerSize } from './services/ledgerStore.js';
+
 /**
  * EventBus — Singleton wrapping Node's native EventEmitter.
  *
  * Architecture invariants:
- *  1. LEDGER-FIRST: every event is appended to the in-memory ledger
- *     before being published to subscribers. When a persistent store is
- *     wired up (Phase 2), the append call here becomes the durable write.
+ *  1. LEDGER-FIRST: every event is written to the durable SQLite ledger
+ *     before being published to subscribers.
  *  2. No event escapes the bus unlogged. Subscribers must never bypass emit().
  *  3. This module exports a single shared instance. Import `eventBus` — never
  *     construct a second EventBus.
@@ -20,13 +21,6 @@ const WILDCARD_TOPIC = '__all__';
 class EventBus {
     readonly #emitter: EventEmitter;
 
-    /**
-     * In-memory ledger — append-only ordered sequence of all emitted events.
-     * Acts as the source-of-truth until Phase 2 wires a PostgreSQL backend.
-     * Read via getLedger(); never mutate directly.
-     */
-    readonly #ledger: SystemEvent[] = [];
-
     constructor() {
         this.#emitter = new EventEmitter();
         // Raise the default listener limit — the simulator + server both subscribe.
@@ -36,13 +30,13 @@ class EventBus {
     /**
      * Emit a SystemEvent onto the bus.
      *
-     * Ledger-first: the event is appended to #ledger synchronously before any
+     * Ledger-first: the event is written to SQLite synchronously before any
      * subscriber is notified. If a subscriber throws, the ledger entry is
      * already committed (consistent with the durability guarantee).
      */
     emit(event: SystemEvent): void {
-        // 1. Durable write (in-memory for Phase 1; swap for DB call in Phase 2)
-        this.#ledger.push(event);
+        // 1. Durable write to SQLite
+        appendEvent(event);
 
         // 2. Publish to type-specific topic
         this.#emitter.emit(event.eventType, event);
@@ -78,18 +72,18 @@ class EventBus {
     }
 
     /**
-     * Returns a shallow copy of the in-memory ledger.
-     * Used by the HTTP replay endpoint to serve historical events to late-joining clients.
+     * Returns all events from the durable SQLite ledger.
+     * Used by the HTTP replay endpoint and WebSocket system:replay.
      */
     getLedger(): readonly SystemEvent[] {
-        return [...this.#ledger];
+        return getAllEvents();
     }
 
     /**
      * Returns the current ledger size — useful for health-check reporting.
      */
     get ledgerSize(): number {
-        return this.#ledger.length;
+        return getLedgerSize();
     }
 }
 

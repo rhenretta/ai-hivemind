@@ -57,12 +57,17 @@ app.get('/health', (_req, res) => {
  *
  * Query params:
  *   ?limit=N  — return only the last N events (default: all)
- *   ?type=T   — filter to a specific SystemEventType
+ *   ?type=T    — filter to a specific SystemEventType
+ *   ?traceId=X — filter to a specific feature/task trace
  */
 app.get('/api/events', (req, res) => {
     let events: readonly SystemEvent[] = eventBus.getLedger();
 
-    const { type, limit } = req.query;
+    const { type, limit, traceId } = req.query;
+
+    if (typeof traceId === 'string' && traceId !== '') {
+        events = events.filter((e) => e.traceId === traceId);
+    }
 
     if (typeof type === 'string' && type !== '') {
         events = events.filter((e) => e.eventType === type);

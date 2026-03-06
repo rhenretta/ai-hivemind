@@ -33,6 +33,9 @@ playwright-report/
 yarn.lock
 package-lock.json
 
+# SQLite database files
+data/
+
 # Claude Code local settings
 .claude/settings.local.json
 .claude/plans/
