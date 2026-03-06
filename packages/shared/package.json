@@ -1,0 +1,37 @@
+{
+    "name": "@ai-hivemind/shared",
+    "version": "0.6.0",
+    "description": "Strict TypeScript types, Zod schemas, and data contracts for all cross-boundary communication in the Agentic Control Plane",
+    "type": "module",
+    "main": "./dist/index.js",
+    "module": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+        ".": {
+            "import": "./dist/index.js",
+            "types": "./dist/index.d.ts"
+        }
+    },
+    "files": [
+        "dist"
+    ],
+    "scripts": {
+        "build": "tsc -p tsconfig.json",
+        "lint": "eslint src --max-warnings=0",
+        "lint:fix": "eslint src --fix",
+        "type-check": "tsc --noEmit",
+        "test:unit": "vitest run --coverage",
+        "clean": "rm -rf dist .turbo"
+    },
+    "dependencies": {
+        "zod": "^3.23.0"
+    },
+    "devDependencies": {
+        "@types/node": "^20.0.0",
+        "vitest": "^1.5.0",
+        "@vitest/coverage-v8": "^1.5.0"
+    },
+    "publishConfig": {
+        "access": "restricted"
+    }
+}

@@ -1,0 +1,38 @@
+.DS_Store
+**/._*
+node_modules/
+dist/
+build/
+.next/
+coverage/
+playwright-report/
+*.tsbuildinfo
+
+# Environment files — never commit secrets
+.env
+.env.local
+.env.*.local
+.env.development
+.env.staging
+.env.production
+
+# Turbo cache
+.turbo/
+
+# Editor artifacts
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# Test output
+/test-results/
+/playwright/.cache/
+
+# Package manager locks (except pnpm)
+yarn.lock
+package-lock.json
+
+# Claude Code local settings
+.claude/settings.local.json
+.claude/plans/

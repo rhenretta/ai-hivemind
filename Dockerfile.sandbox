@@ -1,0 +1,85 @@
+# Dockerfile.sandbox — Isolated Sandbox for Claude Code CLI
+#
+# Each feature task gets a dedicated container from this image.
+# Dependencies are pre-installed; source code is injected per-task via `docker cp`.
+#
+# Build:   docker build -f Dockerfile.sandbox -t ai-hivemind-sandbox:latest .
+# Usage:   Managed by sandboxManager.ts — not run directly.
+
+FROM node:20-slim
+
+# ── System dependencies ──────────────────────────────────────────────────────
+# Claude Code CLI requires these tools at runtime:
+#   - ripgrep (rg): used internally by the Grep tool
+#   - git: version control operations (diff, status, log, etc.)
+#   - curl: used by WebFetch tool and health checks
+#   - jq: JSON processing in Bash tool commands
+#   - tree: directory listing
+#   - rsync: efficient file copying
+#   - build-essential: native Node.js addon compilation (node-gyp, better-sqlite3)
+#   - python3: required by node-gyp for native addon builds
+#   - procps: ps, top, etc. for process inspection
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    rsync \
+    ripgrep \
+    jq \
+    tree \
+    build-essential \
+    python3 \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── pnpm ─────────────────────────────────────────────────────────────────────
+RUN npm install -g pnpm@9
+
+# ── Claude Code CLI ──────────────────────────────────────────────────────────
+RUN npm install -g @anthropic-ai/claude-code
+
+# Disable auto-updates inside container
+ENV DISABLE_AUTOUPDATER=1
+ENV CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1
+
+# ── Non-root user ───────────────────────────────────────────────────────────
+# Claude Code CLI refuses --dangerously-skip-permissions when running as root.
+# The node:20-slim image already includes a 'node' user (uid=1000).
+# We reuse it to avoid UID conflicts.
+
+WORKDIR /workspace
+
+# ── Dependencies (layer-cached) ──────────────────────────────────────────────
+# Copy only package manifests first so pnpm install layer is cached
+# until a dependency version changes.
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+
+# Create workspace directory structure for pnpm
+RUN mkdir -p packages/shared packages/ui apps/backend apps/web apps/sandbox
+
+COPY packages/shared/package.json packages/shared/
+COPY packages/ui/package.json packages/ui/
+COPY apps/backend/package.json apps/backend/
+COPY apps/web/package.json apps/web/
+COPY apps/sandbox/package.json apps/sandbox/
+
+# Install all workspace dependencies (frozen lockfile for reproducibility).
+# This layer is ~738MB but only rebuilds when lockfile changes.
+RUN pnpm install --frozen-lockfile
+
+# Give node user ownership of the workspace (source injected at runtime)
+RUN chown -R node:node /workspace
+
+# ── Exposed ports ────────────────────────────────────────────────────────────
+# Dev server ports that may be started inside the container.
+# Mapped to random host ports at runtime for QA probing.
+EXPOSE 3000 3001 5173 8000
+
+# Switch to non-root user and ensure HOME is set correctly.
+# docker exec doesn't always inherit HOME from /etc/passwd,
+# so we set it explicitly for Claude Code CLI to find ~/.claude config.
+USER node
+ENV HOME=/home/node
+
+# Source code is NOT baked in — injected per-task via `docker cp`.
+# The container runs `tail -f /dev/null` to stay alive, then
+# `docker exec` runs `claude -p <prompt>` inside it.

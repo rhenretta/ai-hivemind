@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "web",
+      "runtimeExecutable": "/Users/rhenretta/workspace/rhenretta/ai-hivemind/.claude/run-pnpm.sh",
+      "runtimeArgs": ["--filter", "@ai-hivemind/web", "dev"],
+      "port": 3000
+    },
+    {
+      "name": "backend",
+      "runtimeExecutable": "/Users/rhenretta/workspace/rhenretta/ai-hivemind/.claude/run-pnpm.sh",
+      "runtimeArgs": ["--filter", "@ai-hivemind/backend", "dev"],
+      "port": 3001
+    }
+  ]
+}

@@ -1,0 +1,114 @@
+{
+    "$schema": "https://turbo.build/schema.json",
+    "globalEnv": [
+        "NODE_ENV",
+        "LOG_LEVEL",
+        "PORT",
+        "BACKEND_CORS_ORIGIN",
+        "OPENAI_API_KEY",
+        "OPENAI_HIGH_TIER_MODEL",
+        "OPENAI_LOW_TIER_MODEL",
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CLI_BIN",
+        "CLAUDE_MAX_TURNS",
+        "MCP_DB_PATH",
+        "RAG_DB_PATH",
+        "CREDENTIAL_MASTER_KEY",
+        "CREDENTIAL_DB_PATH"
+    ],
+    "tasks": {
+        "build": {
+            "dependsOn": [
+                "^build"
+            ],
+            "outputs": [
+                "dist/**",
+                ".next/**",
+                "build/**"
+            ],
+            "env": [
+                "NODE_ENV"
+            ]
+        },
+        "dev": {
+            "dependsOn": [
+                "^build"
+            ],
+            "persistent": true,
+            "cache": false
+        },
+        "lint": {
+            "outputs": [],
+            "inputs": [
+                "src/**/*.ts",
+                "src/**/*.tsx",
+                "src/**/*.js",
+                "src/**/*.jsx",
+                ".eslintrc.*",
+                "tsconfig.json"
+            ]
+        },
+        "lint:fix": {
+            "outputs": [],
+            "cache": false
+        },
+        "type-check": {
+            "dependsOn": [
+                "^build"
+            ],
+            "outputs": [],
+            "inputs": [
+                "src/**/*.ts",
+                "src/**/*.tsx",
+                "tsconfig.json"
+            ]
+        },
+        "test": {
+            "dependsOn": [
+                "build"
+            ],
+            "outputs": [],
+            "cache": false
+        },
+        "test:unit": {
+            "dependsOn": [
+                "build"
+            ],
+            "outputs": [
+                "coverage/**"
+            ],
+            "inputs": [
+                "src/**",
+                "test/**",
+                "vitest.config.*"
+            ]
+        },
+        "test:contract": {
+            "dependsOn": [
+                "^build"
+            ],
+            "outputs": [],
+            "cache": false,
+            "env": [
+                "TEST_NERVE_CENTER_URL",
+                "TEST_API_KEY"
+            ]
+        },
+        "test:e2e": {
+            "dependsOn": [
+                "^build"
+            ],
+            "outputs": [
+                "playwright-report/**"
+            ],
+            "cache": false,
+            "env": [
+                "TEST_BASE_URL",
+                "TEST_ADMIN_TOKEN"
+            ]
+        },
+        "clean": {
+            "cache": false
+        }
+    }
+}

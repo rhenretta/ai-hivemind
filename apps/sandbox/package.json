@@ -1,0 +1,26 @@
+{
+    "name": "@ai-hivemind/sandbox",
+    "version": "0.1.0",
+    "private": true,
+    "description": "Agent Execution Sandboxes — isolated Docker/microVM environments for SWE, UI, and runtime-generated agents",
+    "type": "module",
+    "scripts": {
+        "build": "tsc -p tsconfig.json",
+        "lint": "eslint src --max-warnings=0",
+        "lint:fix": "eslint src --fix",
+        "type-check": "tsc --noEmit",
+        "test:unit": "vitest run --coverage",
+        "clean": "rm -rf dist .turbo"
+    },
+    "dependencies": {
+        "@ai-hivemind/shared": "workspace:*",
+        "zod": "^3.23.0",
+        "pino": "^9.0.0"
+    },
+    "devDependencies": {
+        "@types/node": "^20.0.0",
+        "tsx": "^4.11.0",
+        "vitest": "^1.5.0",
+        "@vitest/coverage-v8": "^1.5.0"
+    }
+}

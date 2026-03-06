@@ -1,0 +1,112 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Force dark theme — Command Center is dark-only */
+    --background: 222 47% 4%;
+    --foreground: 213 31% 91%;
+
+    --card: 222 47% 6%;
+    --card-foreground: 213 31% 91%;
+
+    --popover: 222 47% 6%;
+    --popover-foreground: 213 31% 91%;
+
+    --primary: 188 100% 60%;
+    --primary-foreground: 222 47% 4%;
+
+    --secondary: 222 47% 10%;
+    --secondary-foreground: 213 31% 80%;
+
+    --muted: 222 47% 10%;
+    --muted-foreground: 215 16% 47%;
+
+    --accent: 188 100% 60%;
+    --accent-foreground: 222 47% 4%;
+
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 210 40% 98%;
+
+    --border: 222 47% 12%;
+    --input: 222 47% 10%;
+    --ring: 188 100% 60%;
+
+    --radius: 0.5rem;
+
+    /* Custom token: panel glass effect */
+    --panel-bg: 222 47% 6%;
+    --panel-border: 222 47% 14%;
+
+    /* Inter font variable — set by next/font */
+    --font-inter: 'Inter', system-ui, sans-serif;
+    --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+  }
+}
+
+@layer base {
+  * {
+    border-color: hsl(var(--border));
+  }
+
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: var(--font-inter);
+  }
+
+  /* Custom scrollbar — thin, dark */
+  ::-webkit-scrollbar {
+    width: 4px;
+    height: 4px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: hsl(var(--border));
+    border-radius: 9999px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--muted-foreground));
+  }
+}
+
+/* Topology stage grid pattern placeholder */
+.topology-grid {
+  background-image:
+    linear-gradient(rgba(188, 246, 255, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(188, 246, 255, 0.04) 1px, transparent 1px);
+  background-size: 40px 40px;
+}
+
+/* Ledger terminal font */
+.ledger-mono {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  line-height: 1.5;
+}
+
+/* Connection status pulse animations */
+@keyframes status-pulse {
+
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.4;
+  }
+}
+
+.status-pulse {
+  animation: status-pulse 2s ease-in-out infinite;
+}

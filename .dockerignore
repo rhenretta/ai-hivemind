@@ -1,0 +1,13 @@
+# Docker build context exclusions
+# Used by both Dockerfile (backend) and Dockerfile.sandbox (sandbox)
+
+node_modules
+dist
+.next
+.turbo
+.cache
+.git
+*.log
+.env
+.env.local
+.env.*.local

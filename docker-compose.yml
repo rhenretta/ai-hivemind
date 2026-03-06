@@ -1,0 +1,43 @@
+# AI Hivemind — Docker Compose
+#
+# Runs the Nerve Center (apps/backend) with Claude Code CLI credentials
+# mounted from the host at runtime.
+#
+# Usage:
+#   docker compose up --build
+#
+# Prerequisites:
+#   - Claude Code CLI must be installed and authenticated (run `claude` locally first)
+#   - Copy .env.example to .env.local and fill in OPENAI_API_KEY
+#   - Docker must be installed and running (sandbox containers are managed via Docker socket)
+
+version: '3.9'
+
+services:
+  nerve-center:
+    build:
+      context: .
+      dockerfile: apps/backend/Dockerfile
+    container_name: ai-hivemind-nerve-center
+    ports:
+      - '3001:3001' # Nerve Center API & WebSocket
+      - '3000-3010:3000-3010' # Common dev server ports (CRA, Next.js dev, etc.)
+      - '5173-5180:5173-5180' # Vite default ports
+      - '8000-8010:8000-8010' # Python/FastAPI/other HTTP servers
+    env_file:
+      - .env.local
+    environment:
+      - NODE_ENV=production
+      - CLAUDE_CLI_BIN=claude
+    volumes:
+      # Mount Claude Code config at runtime — never baked into the image
+      - ~/.claude:/root/.claude:ro
+      # Docker socket for sandbox container management (docker create/start/exec/cp/rm)
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+    healthcheck:
+      test: [ 'CMD', 'curl', '-f', 'http://localhost:3001/health' ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
