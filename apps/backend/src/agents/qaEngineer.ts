@@ -163,18 +163,19 @@ Use standard localhost URLs (e.g. http://localhost:3001) — they are automatica
 Run the TypeScript compiler to verify the code compiles without errors:
   execute_cli_command: "cd ${workDir} && pnpm build 2>&1 | tail -30"
 
-### 2. Start the dev server if not already running
-Check whether a dev server is running by probing the frontend/backend ports.
-If connection refused, start the dev server inside the container:
-  execute_cli_command: "cd ${workDir} && pnpm --filter @ai-hivemind/web dev &"
-Wait a few seconds, then re-probe.
+### 2. Start the relevant dev server if not already running
+Only start servers relevant to the files that were changed:
+${hasBackendFiles ? `  - Backend files changed → start backend: execute_cli_command: "cd ${workDir} && pnpm --filter @ai-hivemind/backend dev &"` : '  - No backend files changed — skip backend server'}
+${hasFrontendFiles ? `  - Frontend files changed → start frontend: execute_cli_command: "cd ${workDir} && pnpm --filter @ai-hivemind/web dev &"` : '  - No frontend files changed — skip frontend server'}
+Wait a few seconds after starting, then probe.
 
-### 3. Probe live endpoints (REQUIRED when ports are mapped)
-You MUST probe the sandbox dev server to verify the feature works end-to-end:
-${sandboxFrontendPort !== undefined ? `  - Frontend: http_get { "url": "http://localhost:3000" }` : '  - Frontend port not mapped'}
-${sandboxBackendPort !== undefined ? `  - Backend: http_get { "url": "http://localhost:3001/health" }` : '  - Backend port not mapped'}
+### 3. Probe live endpoints (only for relevant services)
+Probe ONLY the services whose files were changed:
+${hasBackendFiles && sandboxBackendPort !== undefined ? `  - Backend: http_get { "url": "http://localhost:3001/health" }` : '  - Backend: skip (no backend files changed or port not mapped)'}
+${hasFrontendFiles && sandboxFrontendPort !== undefined ? `  - Frontend: http_get { "url": "http://localhost:3000" }` : '  - Frontend: skip (no frontend files changed or port not mapped)'}
 If there are new pages or API routes in the changed files, probe those specific paths too.
 FAIL if: connection refused after starting the dev server, HTTP 4xx/5xx, or the page shows an error state.
+Do NOT probe services whose files were not changed — they may not be running.
 
 ### 4. Validate response content
 Check the HTTP response body matches acceptance criteria:
@@ -192,9 +193,10 @@ Emit your verdict as JSON (NO tool calls after this):
 }
 
 RULES:
-- PASS requires: TypeScript compilation succeeds AND live endpoint returns HTTP 2xx with correct content
-- FAIL if: compile errors, HTTP errors, error messages in rendered page, empty data, acceptance criteria not met
-- A successful compile alone is NOT sufficient for PASS — you MUST verify the feature works via HTTP
+- PASS requires: TypeScript compilation succeeds AND relevant live endpoint returns HTTP 2xx with correct content
+- FAIL if: compile errors, HTTP errors on relevant services, error messages in rendered page, empty data, acceptance criteria not met
+- A successful compile alone is NOT sufficient for PASS — you MUST verify the relevant service works via HTTP
+- Only probe services whose files were changed — do NOT fail because an unrelated service is not running
 - Do NOT fail for: missing Playwright (no browser in container), minor cosmetic issues
 - issues must be specific and actionable — include file paths, error messages, URLs probed, and what you expected`;
     }
