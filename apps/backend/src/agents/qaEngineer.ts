@@ -444,9 +444,14 @@ export class QaEngineer extends BaseAgent {
             }
 
             if (name === 'http_get' || name === 'screenshot_url') {
-                // Rewrite URLs to use sandbox's mapped ports
+                // Rewrite URLs to use sandbox's mapped ports.
+                // Returns null if the port isn't mapped — block the request
+                // to prevent accidentally probing the host's real services.
                 const url = String(args['url'] ?? '');
                 const rewritten = this.#rewriteUrlForSandbox(url);
+                if (rewritten === null) {
+                    return `[BLOCKED] Port not mapped in sandbox — request to ${url} would hit the host, not the sandbox. Available ports: ${JSON.stringify(this.#sandbox.portMap)}`;
+                }
                 return await executeTool(name, { ...args, url: rewritten });
             }
         }
@@ -458,7 +463,13 @@ export class QaEngineer extends BaseAgent {
      * Rewrite a localhost URL to use the sandbox's mapped host port.
      * E.g. "http://localhost:3001/api/foo" → "http://localhost:49153/api/foo"
      */
-    #rewriteUrlForSandbox(url: string): string {
+    /**
+     * Rewrite a localhost URL to use the sandbox's mapped host port.
+     * E.g. "http://localhost:3001/api/foo" → "http://localhost:49153/api/foo"
+     * Returns null if the port is not mapped — caller must block the request
+     * to prevent accidentally hitting the host's real services.
+     */
+    #rewriteUrlForSandbox(url: string): string | null {
         if (this.#sandbox === undefined) return url;
 
         try {
@@ -468,7 +479,10 @@ export class QaEngineer extends BaseAgent {
 
             const containerPort = parseInt(parsed.port, 10);
             const mappedPort = this.#sandbox.portMap[containerPort];
-            if (mappedPort === undefined) return url;
+            if (mappedPort === undefined) {
+                logger.warn(`[${this.agentId}] Blocked request to unmapped port ${containerPort.toString()} — would hit host, not sandbox`);
+                return null;
+            }
 
             parsed.port = mappedPort.toString();
             const rewritten = parsed.toString();
