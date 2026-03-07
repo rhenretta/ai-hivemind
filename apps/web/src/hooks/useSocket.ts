@@ -64,20 +64,48 @@ function routeEvent(event: SystemEvent): void {
 
     switch (event.eventType) {
         case 'USER_COMMAND': {
-            // Create feature entry
-            const objective = typeof event.payload['objective'] === 'string'
-                ? event.payload['objective']
-                : 'New feature';
-            featureStore.upsertFeature({
-                id: traceId,
-                title: objective,
-                description: '',
-                status: 'in_progress',
-                createdAt: event.timestamp,
-                updatedAt: event.timestamp,
-                stepsTotal: 0,
-                stepsComplete: 0,
-            });
+            const intent = event.payload['intent'] as string | undefined;
+            const existing = featureStore.features[traceId];
+
+            // Reconstruct user chat message from the ledger event
+            // (ChatInput adds these optimistically, but they're lost on page reload)
+            const userText = typeof event.payload['originalText'] === 'string'
+                ? event.payload['originalText']
+                : typeof event.payload['objective'] === 'string'
+                    ? event.payload['objective']
+                    : null;
+            if (userText !== null) {
+                chatStore.appendMessage({
+                    id: event.eventId,
+                    role: 'user',
+                    text: userText,
+                    timestamp: event.timestamp,
+                    traceId,
+                    type: 'text',
+                });
+            }
+
+            if (intent === 'continue_feature' && existing !== undefined) {
+                // Continue existing feature — reset status, don't overwrite title
+                featureStore.updateFeatureStatus(traceId, 'in_progress');
+            } else if (existing === undefined) {
+                // New feature — use originalText (if available) for a clean title
+                const title = typeof event.payload['originalText'] === 'string'
+                    ? event.payload['originalText']
+                    : typeof event.payload['objective'] === 'string'
+                        ? event.payload['objective']
+                        : 'New feature';
+                featureStore.upsertFeature({
+                    id: traceId,
+                    title,
+                    description: '',
+                    status: 'in_progress',
+                    createdAt: event.timestamp,
+                    updatedAt: event.timestamp,
+                    stepsTotal: 0,
+                    stepsComplete: 0,
+                });
+            }
             break;
         }
 
@@ -257,6 +285,29 @@ function routeEvent(event: SystemEvent): void {
             break;
         }
 
+        case 'USER_INTERVENTION': {
+            // Reconstruct user intervention messages (approval, clarification responses)
+            const interventionText = typeof event.payload['text'] === 'string'
+                ? event.payload['text']
+                : null;
+            if (interventionText !== null) {
+                chatStore.appendMessage({
+                    id: event.eventId,
+                    role: 'user',
+                    text: interventionText,
+                    timestamp: event.timestamp,
+                    traceId,
+                    type: 'text',
+                });
+            }
+            break;
+        }
+
+        case 'FEATURE_DELETED': {
+            featureStore.deleteFeature(traceId);
+            break;
+        }
+
         case 'ERROR': {
             const message = typeof event.payload['message'] === 'string'
                 ? event.payload['message']
@@ -299,9 +350,55 @@ export function useSocket(): void {
         const onSystemEvent = (event: SystemEvent): void => { routeEvent(event); };
         const onSystemReplay = (events: SystemEvent[]): void => {
             bulkLoad(events);
+            // Clear chat messages before replay — they'll be reconstructed by routeEvent
+            // This prevents duplicates on reconnect (where old in-memory messages
+            // would overlap with replayed events).
+            useChatStore.getState().loadHistory([]);
             // Replay events through router for store hydration
             for (const event of events) {
                 routeEvent(event);
+            }
+        };
+        const onIntentResolved = (data: {
+            clientEventId: string;
+            traceId: string;
+            intent: string;
+            reasoning: string;
+        }): void => {
+            const chatState = useChatStore.getState();
+            const featureState = useFeatureStore.getState();
+
+            // Link the optimistic chat message to the resolved traceId
+            chatState.updateMessage(data.clientEventId, { traceId: data.traceId });
+
+            if (data.intent === 'new_feature') {
+                // Create feature entry (continue/provide_input features already exist)
+                const msg = chatState.messages.find((m) => m.id === data.clientEventId);
+                featureState.upsertFeature({
+                    id: data.traceId,
+                    title: msg?.text ?? 'New feature',
+                    description: '',
+                    status: 'in_progress',
+                    createdAt: new Date().toISOString(),
+                    updatedAt: new Date().toISOString(),
+                    stepsTotal: 0,
+                    stepsComplete: 0,
+                });
+            } else {
+                // Show acknowledgment for continue/provide_input
+                const feature = featureState.features[data.traceId];
+                const featureTitle = feature?.title ?? 'the feature';
+                const ackText = data.intent === 'continue_feature'
+                    ? `Continuing work on "${featureTitle}"...`
+                    : `Sending your response to "${featureTitle}"...`;
+                chatState.appendMessage({
+                    id: uuid(),
+                    role: 'ai',
+                    text: ackText,
+                    timestamp: new Date().toISOString(),
+                    traceId: data.traceId,
+                    type: 'text',
+                });
             }
         };
 
@@ -312,6 +409,7 @@ export function useSocket(): void {
         ws.io.on('reconnect_failed', onReconnectFailed);
         ws.on('system:event', onSystemEvent);
         ws.on('system:replay', onSystemReplay);
+        ws.on('intent:resolved', onIntentResolved);
 
         if (ws.connected) {
             setStatus('connected');
@@ -325,6 +423,7 @@ export function useSocket(): void {
             ws.io.off('reconnect_failed', onReconnectFailed);
             ws.off('system:event', onSystemEvent);
             ws.off('system:replay', onSystemReplay);
+            ws.off('intent:resolved', onIntentResolved);
         };
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);

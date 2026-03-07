@@ -1,6 +1,6 @@
 'use client';
 
-import { Send } from 'lucide-react';
+import { Send, Trash2 } from 'lucide-react';
 import Link from 'next/link';
 import { useCallback, useState } from 'react';
 import { v4 as uuid } from 'uuid';
@@ -21,6 +21,13 @@ export function FeatureCard({ feature }: FeatureCardProps) {
     const [response, setResponse] = useState('');
     const appendMessage = useChatStore((s) => s.appendMessage);
     const clearFeatureNeedsInput = useFeatureStore((s) => s.clearFeatureNeedsInput);
+
+    const handleDelete = useCallback((e: React.MouseEvent) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const ws = getSocket();
+        ws.emit('user:delete-feature', { traceId: feature.id });
+    }, [feature.id]);
 
     const handleRespond = useCallback(() => {
         if (response.trim() === '') return;
@@ -51,11 +58,18 @@ export function FeatureCard({ feature }: FeatureCardProps) {
     return (
         <div className={`rounded-lg border ${isBlocked ? 'border-orange-500/40 bg-orange-500/5' : 'border-border/50 bg-card'} p-3 space-y-2.5 transition-colors hover:border-border`}>
             <Link href={`/features/${feature.id}`} className="block space-y-2.5">
-                {/* Title + status */}
+                {/* Title + delete */}
                 <div className="flex items-start justify-between gap-2">
-                    <h3 className="text-sm font-medium text-foreground line-clamp-2 leading-snug">
+                    <h3 className="text-sm font-medium text-foreground line-clamp-2 leading-snug flex-1">
                         {feature.title}
                     </h3>
+                    <button
+                        onClick={handleDelete}
+                        className="shrink-0 p-1 rounded text-muted-foreground/50 hover:text-red-400 hover:bg-red-500/10 transition-colors"
+                        title="Delete feature"
+                    >
+                        <Trash2 className="w-3.5 h-3.5" />
+                    </button>
                 </div>
 
                 {/* Progress bar */}

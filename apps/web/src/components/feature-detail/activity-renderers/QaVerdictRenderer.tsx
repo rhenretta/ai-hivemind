@@ -3,6 +3,8 @@
 import { type SystemEvent } from '@ai-hivemind/shared';
 import { CheckCircle, XCircle } from 'lucide-react';
 
+import { QaTestPlanRenderer } from './QaTestPlanRenderer';
+
 interface QaVerdictRendererProps {
     event: SystemEvent;
 }
@@ -11,6 +13,8 @@ export function QaVerdictRenderer({ event }: QaVerdictRendererProps) {
     const passed = event.payload['passed'] === true;
     const subtask = typeof event.payload['subtask'] === 'string' ? event.payload['subtask'] : '';
     const issues = Array.isArray(event.payload['issues']) ? (event.payload['issues'] as string[]) : [];
+    const summary = typeof event.payload['summary'] === 'string' ? event.payload['summary'] : '';
+    const testPlan = event.payload['testPlan'] as { tests: { id: string; name: string; description?: string; type: string; status: string; result?: string }[] } | undefined;
 
     return (
         <div className="space-y-2">
@@ -26,21 +30,31 @@ export function QaVerdictRenderer({ event }: QaVerdictRendererProps) {
             </div>
 
             {subtask !== '' && (
-                <p className="text-xs text-muted-foreground pl-6">
+                <p className="text-xs text-muted-foreground pl-6 whitespace-pre-wrap break-words">
                     Subtask: {subtask}
                 </p>
             )}
 
             {!passed && issues.length > 0 && (
-                <ul className="pl-6 space-y-1">
+                <ul className="pl-6 space-y-1.5">
                     {issues.map((issue, i) => (
                         <li key={i} className="text-xs text-red-300/80 flex items-start gap-1.5">
-                            <span className="text-red-500 mt-1.5 shrink-0 w-1 h-1 rounded-full bg-red-400" />
-                            {typeof issue === 'string' ? issue : JSON.stringify(issue)}
+                            <span className="mt-1.5 shrink-0 w-1.5 h-1.5 rounded-full bg-red-400" />
+                            <span className="whitespace-pre-wrap break-words">
+                                {typeof issue === 'string' ? issue : JSON.stringify(issue)}
+                            </span>
                         </li>
                     ))}
                 </ul>
             )}
+
+            {summary !== '' && (
+                <p className="text-xs text-foreground/60 pl-6 whitespace-pre-wrap break-words">
+                    {summary}
+                </p>
+            )}
+
+            {testPlan !== undefined && <div className="pl-6"><QaTestPlanRenderer plan={testPlan} /></div>}
         </div>
     );
 }

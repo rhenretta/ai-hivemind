@@ -11,6 +11,7 @@ import { FeatureStatusBadge } from '../shared/FeatureStatusBadge';
 import { ProgressBar } from '../shared/ProgressBar';
 
 import { ActivityTab } from './ActivityTab';
+import { LogsTab } from './LogsTab';
 import { OverviewTab } from './OverviewTab';
 import { PreviewTab } from './PreviewTab';
 import { StepsTab } from './StepsTab';
@@ -30,11 +31,16 @@ export function FeatureDetailView({ featureId }: FeatureDetailViewProps) {
     );
 
     // Determine available tabs
+    const hasSandboxLogs = useMemo(
+        () => events.some((e) => e.eventType === 'SANDBOX_LOG'),
+        [events],
+    );
     const tabs = useMemo(() => {
         const list: TabId[] = ['overview', 'steps', 'activity', 'terminal'];
+        if (hasSandboxLogs) list.push('logs');
         if (feature?.previewUrl !== undefined && feature.previewUrl !== '') list.push('preview');
         return list;
-    }, [feature?.previewUrl]);
+    }, [feature?.previewUrl, hasSandboxLogs]);
 
     if (feature === undefined) {
         return (
@@ -58,7 +64,7 @@ export function FeatureDetailView({ featureId }: FeatureDetailViewProps) {
             {/* Tab bar + content */}
             <TabBar tabs={tabs} featureId={featureId}>
                 {(activeTab) => (
-                    <div className={`flex-1 ${activeTab === 'terminal' || activeTab === 'preview' ? 'overflow-hidden flex flex-col' : 'overflow-y-auto p-6'}`}>
+                    <div className={`flex-1 ${activeTab === 'terminal' || activeTab === 'preview' || activeTab === 'logs' ? 'overflow-hidden flex flex-col' : 'overflow-y-auto p-6'}`}>
                         {activeTab === 'overview' && (
                             <OverviewTab feature={feature} events={events} />
                         )}
@@ -70,6 +76,9 @@ export function FeatureDetailView({ featureId }: FeatureDetailViewProps) {
                         )}
                         {activeTab === 'terminal' && (
                             <TerminalTab events={events} />
+                        )}
+                        {activeTab === 'logs' && (
+                            <LogsTab events={events} />
                         )}
                         {activeTab === 'preview' && feature.previewUrl !== undefined && feature.previewUrl !== '' && (
                             <PreviewTab url={feature.previewUrl} />

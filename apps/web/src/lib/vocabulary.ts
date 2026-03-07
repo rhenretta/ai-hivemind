@@ -50,6 +50,7 @@ export const KANBAN_COLUMNS: FeatureStatus[] = [
     'in_progress',
     'qa_in_progress',
     'blocked',
+    'failed',
     'completed',
     'live',
 ];

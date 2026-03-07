@@ -5,6 +5,7 @@
  *
  * No external dependencies — pure React.
  * Color-codes by JS type: string=green, number=amber, boolean=pink, null=slate.
+ * Long strings are expandable — no truncation by default.
  */
 
 import { ChevronRight } from 'lucide-react';
@@ -17,6 +18,42 @@ type JsonValue =
     | null
     | { [key: string]: JsonValue }
     | JsonValue[];
+
+const LONG_STRING_THRESHOLD = 200;
+
+/** Expandable string value — shows full content with toggle for long values */
+function JsonString({ value }: { value: string }) {
+    const [expanded, setExpanded] = useState(false);
+    const isLong = value.length > LONG_STRING_THRESHOLD;
+    const isMultiline = value.includes('\n');
+
+    // Short strings: show inline
+    if (!isLong && !isMultiline) {
+        return (
+            <span className="text-emerald-400 font-mono text-xs break-all whitespace-pre-wrap">
+                &quot;{value}&quot;
+            </span>
+        );
+    }
+
+    // Long or multiline strings: expandable block
+    const preview = value.slice(0, LONG_STRING_THRESHOLD);
+
+    return (
+        <span className="inline-block w-full">
+            <span className="text-emerald-400 font-mono text-xs break-all whitespace-pre-wrap">
+                &quot;{expanded ? value : `${preview}…`}&quot;
+            </span>
+            <button
+                type="button"
+                onClick={(e) => { e.stopPropagation(); setExpanded(!expanded); }}
+                className="ml-1 text-[10px] text-primary hover:text-primary/80 transition-colors"
+            >
+                {expanded ? 'collapse' : `${value.length} chars`}
+            </button>
+        </span>
+    );
+}
 
 interface JsonNodeProps {
     value: JsonValue;
@@ -39,12 +76,7 @@ function JsonNode({ value, depth = 0 }: JsonNodeProps) {
     }
 
     if (typeof value === 'string') {
-        const display = value.length > 120 ? `${value.slice(0, 120)}…` : value;
-        return (
-            <span className="text-emerald-400 font-mono text-xs break-all">
-                &quot;{display}&quot;
-            </span>
-        );
+        return <JsonString value={value} />;
     }
 
     // Array
@@ -112,7 +144,7 @@ interface JsonTreeRendererProps {
 
 export function JsonTreeRenderer({ data }: JsonTreeRendererProps) {
     return (
-        <div className="rounded-md bg-black/30 border border-border/30 p-3 overflow-auto max-h-full">
+        <div className="rounded-md bg-black/30 border border-border/30 p-3 overflow-auto max-h-[600px]">
             <JsonNode value={data as unknown as JsonValue} />
         </div>
     );

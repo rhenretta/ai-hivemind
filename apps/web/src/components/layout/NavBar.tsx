@@ -1,6 +1,6 @@
 'use client';
 
-import { Globe, LayoutGrid, MessageSquare, Sparkles } from 'lucide-react';
+import { Globe, LayoutGrid, MessageSquare, Settings, Sparkles } from 'lucide-react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { useEffect, useState } from 'react';
@@ -94,6 +94,22 @@ export function NavBar() {
                     </Link>
                 ))}
             </div>
+
+            {/* Settings */}
+            <Link
+                href="/settings"
+                className={`
+                    flex items-center justify-center w-10 h-10 rounded-lg
+                    transition-colors duration-150 mb-1
+                    ${pathname === '/settings'
+                        ? 'bg-primary/15 text-primary'
+                        : 'text-muted-foreground hover:text-foreground hover:bg-secondary/50'
+                    }
+                `}
+                title="Settings"
+            >
+                <Settings className="w-5 h-5" />
+            </Link>
 
             {/* Connection status */}
             <ConnectionIndicator />

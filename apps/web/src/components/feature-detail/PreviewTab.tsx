@@ -20,7 +20,7 @@ export function PreviewTab({ url }: PreviewTabProps) {
     const config = DEVICE_SIZES[device];
 
     return (
-        <div className="flex flex-col h-full -m-6">
+        <div className="flex flex-col h-full">
             {/* Toolbar */}
             <div className="shrink-0 flex items-center justify-between px-4 py-2 border-b border-border/50 bg-card">
                 <div className="flex gap-1">
@@ -51,15 +51,22 @@ export function PreviewTab({ url }: PreviewTabProps) {
                 </a>
             </div>
 
-            {/* iframe */}
+            {/* iframe container */}
             <div className="flex-1 flex justify-center bg-background/50 overflow-hidden">
                 <div
                     className="h-full transition-all duration-300 border-x border-border/30"
                     style={{ width: config.width, maxWidth: '100%' }}
                 >
+                    {/*
+                      No sandbox attribute: The preview URL is always on a different port
+                      (different origin) from the parent app, so the browser's same-origin
+                      policy already prevents it from accessing parent DOM, cookies, or storage.
+                      The sandbox attribute was causing CSS injection failures in Next.js dev
+                      mode — even with allow-scripts + allow-same-origin, Tailwind/PostCSS
+                      styles weren't loading inside the sandboxed iframe.
+                    */}
                     <iframe
                         src={url}
-                        sandbox="allow-scripts"
                         className="w-full h-full border-0 bg-white"
                         title="Feature preview"
                     />

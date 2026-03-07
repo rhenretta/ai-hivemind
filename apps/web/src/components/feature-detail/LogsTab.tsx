@@ -1,64 +1,58 @@
 'use client';
 
 import { type SystemEvent } from '@ai-hivemind/shared';
-import { ArrowDown, Clock, Eye, EyeOff } from 'lucide-react';
+import { ArrowDown, Clock } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-interface TerminalTabProps {
+interface LogsTabProps {
     events: SystemEvent[];
 }
 
-type StreamKind = 'thought' | 'message' | 'tool' | 'result' | 'input' | 'error';
+type LogSource = 'stdout' | 'stderr' | 'backend' | 'frontend';
 
-interface TerminalLine {
+interface LogLine {
     id: string;
     timestamp: string;
     text: string;
-    kind: StreamKind;
-    direction: string;
+    source: LogSource;
 }
 
-const KIND_STYLES: Record<StreamKind, string> = {
-    thought: 'text-slate-500 italic',
-    message: 'text-slate-200',
-    tool: 'text-teal-400',
-    result: 'text-emerald-400',
-    input: 'text-blue-400',
-    error: 'text-red-400',
+const SOURCE_STYLES: Record<LogSource, string> = {
+    stdout: 'text-slate-300',
+    stderr: 'text-amber-400',
+    backend: 'text-teal-400',
+    frontend: 'text-violet-400',
 };
 
-const KIND_PREFIX: Record<StreamKind, string> = {
-    thought: '',
-    message: '',
-    tool: '$ ',
-    result: '  ',
-    input: '> ',
-    error: '! ',
+const SOURCE_LABELS: Record<LogSource, string> = {
+    stdout: 'out',
+    stderr: 'err',
+    backend: 'be',
+    frontend: 'fe',
 };
 
-export function TerminalTab({ events }: TerminalTabProps) {
+export function LogsTab({ events }: LogsTabProps) {
     const containerRef = useRef<HTMLDivElement>(null);
     const isUserScrolledUp = useRef(false);
     const [showTimestamps, setShowTimestamps] = useState(false);
-    const [showThoughts, setShowThoughts] = useState(true);
+    const [sourceFilter, setSourceFilter] = useState<LogSource | 'all'>('all');
 
     const lines = useMemo(() => {
-        const result: TerminalLine[] = [];
+        const result: LogLine[] = [];
         for (const event of events) {
-            if (event.eventType !== 'CONDUCTOR_STREAM') continue;
+            if (event.eventType !== 'SANDBOX_LOG') continue;
             const text = typeof event.payload['text'] === 'string' ? event.payload['text'] : '';
-            const kind = (typeof event.payload['kind'] === 'string' ? event.payload['kind'] : 'message') as StreamKind;
-            const direction = typeof event.payload['direction'] === 'string' ? event.payload['direction'] : 'out';
+            const source = (typeof event.payload['source'] === 'string' ? event.payload['source'] : 'stdout') as LogSource;
             if (text === '') continue;
-            result.push({ id: event.eventId, timestamp: event.timestamp, text, kind, direction });
+            result.push({ id: event.eventId, timestamp: event.timestamp, text, source });
         }
         return result;
     }, [events]);
 
     const visibleLines = useMemo(() => {
-        if (showThoughts) return lines;
-        return lines.filter((l) => l.kind !== 'thought');
-    }, [lines, showThoughts]);
+        if (sourceFilter === 'all') return lines;
+        return lines.filter((l) => l.source === sourceFilter);
+    }, [lines, sourceFilter]);
 
     const scrollToBottom = useCallback(() => {
         const el = containerRef.current;
@@ -89,6 +83,8 @@ export function TerminalTab({ events }: TerminalTabProps) {
         }
     }, []);
 
+    const sources: (LogSource | 'all')[] = ['all', 'backend', 'frontend', 'stderr', 'stdout'];
+
     return (
         <div className="flex-1 flex flex-col overflow-hidden">
             {/* Toolbar */}
@@ -104,17 +100,20 @@ export function TerminalTab({ events }: TerminalTabProps) {
                     <Clock className="w-3 h-3" />
                     Timestamps
                 </button>
-                <button
-                    onClick={() => setShowThoughts((v) => !v)}
-                    className={`inline-flex items-center gap-1.5 px-2 py-1 text-xs rounded-md transition-colors ${
-                        showThoughts
-                            ? 'bg-primary/20 text-primary'
-                            : 'text-muted-foreground hover:text-foreground hover:bg-secondary/50'
-                    }`}
-                >
-                    {showThoughts ? <Eye className="w-3 h-3" /> : <EyeOff className="w-3 h-3" />}
-                    Thinking
-                </button>
+                <div className="h-4 w-px bg-border/30" />
+                {sources.map((s) => (
+                    <button
+                        key={s}
+                        onClick={() => setSourceFilter(s)}
+                        className={`px-2 py-1 text-xs rounded-md transition-colors ${
+                            sourceFilter === s
+                                ? 'bg-primary/20 text-primary'
+                                : 'text-muted-foreground hover:text-foreground hover:bg-secondary/50'
+                        }`}
+                    >
+                        {s === 'all' ? 'All' : s}
+                    </button>
+                ))}
                 <div className="flex-1" />
                 {isUserScrolledUp.current && (
                     <button
@@ -133,7 +132,7 @@ export function TerminalTab({ events }: TerminalTabProps) {
                 </span>
             </div>
 
-            {/* Terminal output */}
+            {/* Log output */}
             <div
                 ref={containerRef}
                 onScroll={handleScroll}
@@ -142,7 +141,7 @@ export function TerminalTab({ events }: TerminalTabProps) {
             >
                 {visibleLines.length === 0 ? (
                     <div className="flex items-center justify-center h-full">
-                        <p className="text-slate-600 text-sm">No terminal output yet</p>
+                        <p className="text-slate-600 text-sm">No server logs yet</p>
                     </div>
                 ) : (
                     <div className="p-3 space-y-px">
@@ -153,8 +152,11 @@ export function TerminalTab({ events }: TerminalTabProps) {
                                         {formatTime(line.timestamp)}
                                     </span>
                                 )}
-                                <span className={`${KIND_STYLES[line.kind]} whitespace-pre-wrap break-all`}>
-                                    {KIND_PREFIX[line.kind]}{line.text}
+                                <span className="shrink-0 text-[10px] w-[1.5rem] text-slate-600 select-none text-right">
+                                    {SOURCE_LABELS[line.source]}
+                                </span>
+                                <span className={`${SOURCE_STYLES[line.source]} whitespace-pre-wrap break-all`}>
+                                    {line.text}
                                 </span>
                             </div>
                         ))}

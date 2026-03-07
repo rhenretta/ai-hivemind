@@ -19,7 +19,7 @@ export function ToolUsedRenderer({ event, nextEvent }: ToolUsedRendererProps) {
         return <CodeChangeRenderer event={event} />;
     }
 
-    if (source === 'conductor:tool_result') {
+    if (source === 'conductor:tool_result' || source === 'qa:tool_result') {
         return <ToolResultRenderer event={event} />;
     }
 
@@ -34,29 +34,32 @@ function CodeChangeRenderer({ event }: { event: SystemEvent }) {
 
     return (
         <div className="space-y-2">
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
                 <FileCode className="w-3.5 h-3.5 text-amber-400 shrink-0" />
                 <span className="text-xs font-mono text-amber-300">{fileName}</span>
                 {description !== '' && (
-                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400">
+                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400 break-words">
                         {description}
                     </span>
                 )}
             </div>
-            <div className="text-[10px] text-muted-foreground font-mono truncate pl-5.5">
+            <div className="text-[10px] text-muted-foreground font-mono break-all pl-5.5">
                 {filePath}
             </div>
         </div>
     );
 }
 
+const OUTPUT_PREVIEW_THRESHOLD = 800;
+
 function ToolResultRenderer({ event }: { event: SystemEvent }) {
     const [showFull, setShowFull] = useState(false);
     const output = typeof event.payload['output'] === 'string' ? event.payload['output'] : '';
     const status = typeof event.payload['status'] === 'string' ? event.payload['status'] : 'ok';
     const isError = status === 'error';
-    const truncated = output.length > 300 && !showFull;
-    const displayOutput = truncated ? `${output.slice(0, 300)}...` : output;
+    const isScreenshot = output.startsWith('data:image/');
+    const isLong = !isScreenshot && output.length > OUTPUT_PREVIEW_THRESHOLD;
+    const displayOutput = isLong && !showFull ? `${output.slice(0, OUTPUT_PREVIEW_THRESHOLD)}…` : output;
 
     return (
         <div className="space-y-2">
@@ -67,18 +70,32 @@ function ToolResultRenderer({ event }: { event: SystemEvent }) {
                 }`}>
                     {status}
                 </span>
+                {isLong && (
+                    <span className="text-[10px] text-muted-foreground/60">
+                        {output.length.toLocaleString()} chars
+                    </span>
+                )}
             </div>
-            {output !== '' && (
-                <div className="rounded-md bg-black/20 border border-border/20 p-2">
-                    <pre className="text-[11px] text-foreground/70 font-mono whitespace-pre-wrap break-all">
+            {isScreenshot && (
+                <div className="rounded-md bg-black/20 border border-border/20 p-1 max-h-[500px] overflow-auto">
+                    <img
+                        src={output}
+                        alt="QA screenshot"
+                        className="w-full rounded"
+                    />
+                </div>
+            )}
+            {!isScreenshot && output !== '' && (
+                <div className="rounded-md bg-black/20 border border-border/20 p-2 max-h-[500px] overflow-auto">
+                    <pre className="text-[11px] text-foreground/70 font-mono whitespace-pre-wrap break-words">
                         {displayOutput}
                     </pre>
-                    {output.length > 300 && (
+                    {isLong && (
                         <button
                             onClick={() => setShowFull((v) => !v)}
-                            className="text-[10px] text-primary hover:text-primary/80 mt-1"
+                            className="text-[10px] text-primary hover:text-primary/80 mt-1.5 sticky bottom-0"
                         >
-                            {showFull ? 'Show less' : `Show all (${output.length} chars)`}
+                            {showFull ? 'Show less' : `Show full output (${output.length.toLocaleString()} chars)`}
                         </button>
                     )}
                 </div>
@@ -102,26 +119,26 @@ function ToolInvocationRenderer({
     const isBash = toolName.toLowerCase().includes('bash');
     const isFileOp = toolName === 'Edit' || toolName === 'Write' || toolName === 'Read';
 
-    // Check if next event is the tool result
+    // Check if next event is the tool result (from conductor or QA)
     const hasResult = nextEvent !== undefined
         && nextEvent.eventType === 'TOOL_USED'
         && typeof nextEvent.payload['source'] === 'string'
-        && nextEvent.payload['source'] === 'conductor:tool_result';
+        && (nextEvent.payload['source'] === 'conductor:tool_result' || nextEvent.payload['source'] === 'qa:tool_result');
 
     return (
         <div className="space-y-2">
             {/* Tool name badge */}
-            <div className="flex items-center gap-2 flex-wrap">
+            <div className="flex items-start gap-2 flex-wrap">
                 {isBash ? (
-                    <TerminalIcon className="w-3.5 h-3.5 text-teal-400 shrink-0" />
+                    <TerminalIcon className="w-3.5 h-3.5 text-teal-400 shrink-0 mt-0.5" />
                 ) : (
-                    <FileCode className="w-3.5 h-3.5 text-teal-400 shrink-0" />
+                    <FileCode className="w-3.5 h-3.5 text-teal-400 shrink-0 mt-0.5" />
                 )}
                 <span className="text-xs font-mono font-medium px-1.5 py-0.5 rounded bg-teal-500/10 text-teal-400">
                     {toolName}
                 </span>
                 {filePath !== '' && (
-                    <span className="text-[10px] text-muted-foreground font-mono truncate">
+                    <span className="text-[10px] text-muted-foreground font-mono break-all">
                         {filePath}
                     </span>
                 )}
@@ -130,7 +147,7 @@ function ToolInvocationRenderer({
             {/* Input section */}
             {isBash && command !== '' && (
                 <div className="rounded-md bg-black/20 border border-border/20 p-2">
-                    <pre className="text-[11px] text-teal-300/80 font-mono whitespace-pre-wrap break-all">
+                    <pre className="text-[11px] text-teal-300/80 font-mono whitespace-pre-wrap break-words">
                         $ {command}
                     </pre>
                 </div>

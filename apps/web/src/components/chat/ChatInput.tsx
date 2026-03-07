@@ -6,57 +6,39 @@ import { v4 as uuid } from 'uuid';
 
 import { getSocket } from '@/hooks/useSocket';
 import { useChatStore } from '@/stores/chatStore';
-import { useFeatureStore } from '@/stores/featureStore';
 
 export function ChatInput() {
     const [text, setText] = useState('');
     const appendMessage = useChatStore((s) => s.appendMessage);
     const setAiTyping = useChatStore((s) => s.setAiTyping);
-    const upsertFeature = useFeatureStore((s) => s.upsertFeature);
 
     const handleSubmit = useCallback(() => {
         const trimmed = text.trim();
         if (trimmed === '') return;
 
-        const traceId = uuid();
-        const eventId = uuid();
+        const clientEventId = uuid();
         const timestamp = new Date().toISOString();
 
-        // Optimistic: add user message to chat
+        // Optimistic: add user message to chat (no traceId yet — backend resolves it)
         appendMessage({
-            id: eventId,
+            id: clientEventId,
             role: 'user',
             text: trimmed,
             timestamp,
-            traceId,
             type: 'text',
-        });
-
-        // Optimistic: create feature entry
-        upsertFeature({
-            id: traceId,
-            title: trimmed,
-            description: '',
-            status: 'in_progress',
-            createdAt: timestamp,
-            updatedAt: timestamp,
-            stepsTotal: 0,
-            stepsComplete: 0,
         });
 
         setAiTyping(true);
 
-        // Send to backend
+        // Send to backend for intent classification
         const ws = getSocket();
-        ws.emit('user:command', {
-            objective: trimmed,
-            traceId,
-            eventId,
-            timestamp,
+        ws.emit('user:message', {
+            text: trimmed,
+            clientEventId,
         });
 
         setText('');
-    }, [text, appendMessage, setAiTyping, upsertFeature]);
+    }, [text, appendMessage, setAiTyping]);
 
     return (
         <div className="shrink-0 px-6 py-4 border-t border-border/50">

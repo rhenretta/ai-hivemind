@@ -2,13 +2,14 @@
 
 import { type ReactNode, useState } from 'react';
 
-export type TabId = 'overview' | 'steps' | 'activity' | 'terminal' | 'preview';
+export type TabId = 'overview' | 'steps' | 'activity' | 'terminal' | 'logs' | 'preview';
 
 const TAB_LABELS: Record<TabId, string> = {
     overview: 'Overview',
     steps: 'Steps',
     activity: 'Activity',
     terminal: 'Terminal',
+    logs: 'Server Logs',
     preview: 'Preview',
 };
 

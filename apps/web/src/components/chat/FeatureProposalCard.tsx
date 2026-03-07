@@ -37,7 +37,7 @@ export function FeatureProposalCard({ messageId, traceId, proposal }: FeaturePro
         const ws = getSocket();
         ws.emit('user:intervention', {
             text: 'APPROVED',
-            targetId: 'coordinator',
+            targetId: 'project-manager',
             traceId,
         });
     }, [messageId, traceId, proposal, updateMessage, appendMessage, updateFeatureStatus]);

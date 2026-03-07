@@ -35,13 +35,13 @@ export function TaskNodeRenderer({ event }: TaskNodeRendererProps) {
 
             {result !== '' && (
                 <div className="pl-6">
-                    <p className="text-xs text-foreground/70">{result}</p>
+                    <p className="text-xs text-foreground/70 whitespace-pre-wrap break-words">{result}</p>
                 </div>
             )}
 
             {error !== '' && (
                 <div className="pl-6 rounded-md bg-red-500/5 border border-red-500/20 p-2">
-                    <p className="text-xs text-red-300">{error}</p>
+                    <p className="text-xs text-red-300 whitespace-pre-wrap break-words">{error}</p>
                 </div>
             )}
         </div>

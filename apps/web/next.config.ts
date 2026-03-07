@@ -12,6 +12,16 @@ const nextConfig: NextConfig = {
     // Disable x-powered-by header
     poweredByHeader: false,
 
+    // Proxy /api/* requests to the Express backend.
+    // This allows frontend code to use relative paths (fetch("/api/foo"))
+    // instead of hardcoding a port. BACKEND_PORT is injected as an env var
+    // in sandbox containers; defaults to 3001 for local dev.
+    rewrites: async () => [
+        {
+            source: '/api/:path*',
+            destination: `http://localhost:${process.env['BACKEND_PORT'] ?? '3001'}/api/:path*`,
+        },
+    ],
 };
 
 export default nextConfig;

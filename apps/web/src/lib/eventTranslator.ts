@@ -2,10 +2,13 @@ import { type SystemEvent } from '@ai-hivemind/shared';
 
 /**
  * Translates a raw SystemEvent into a user-friendly activity summary.
- * Returns null for events that should be hidden from non-technical users.
+ * Returns null for events that should be hidden from the activity log.
+ *
+ * Conductor-internal events (Claude Code tool calls, streaming) are hidden —
+ * those are visible in the Terminal tab. Only agent-level actions are shown here.
  */
 export function translateEvent(event: SystemEvent): string | null {
-    const { eventType, payload } = event;
+    const { eventType, payload, sourceId } = event;
 
     switch (eventType) {
         case 'USER_COMMAND':
@@ -21,41 +24,81 @@ export function translateEvent(event: SystemEvent): string | null {
             if (payload['awaitingApproval'] === true) {
                 return null; // Shown as proposal card
             }
-            const state = typeof payload['state'] === 'string' ? payload['state'] : null;
-            if (state === 'PLANNING') return 'Planning the approach...';
-            if (state === 'EXECUTING') return 'Working on it...';
+            if (payload['passed'] === true) return 'QA passed';
+            if (payload['passed'] === false) return 'QA failed — retrying';
+
+            // Test plan updates from QA agent
+            const testPlan = payload['testPlan'] as { tests: { status: string }[] } | undefined;
+            if (testPlan !== undefined) {
+                const total = testPlan.tests.length;
+                const passed = testPlan.tests.filter((t) => t.status === 'passed').length;
+                const failed = testPlan.tests.filter((t) => t.status === 'failed').length;
+                return `QA testing: ${passed}/${total} passed${failed > 0 ? `, ${failed} failed` : ''}`;
+            }
+
+            const message = typeof payload['message'] === 'string' ? payload['message'] : null;
+            const phase = typeof payload['phase'] === 'string' ? payload['phase'] : null;
+
+            // Hide PM orchestration phases — redundant with child agent rows
+            // (Data Researcher, UX Designer, SWE appear as their own rows)
+            if (typeof sourceId === 'string' && sourceId.startsWith('project-manager')) {
+                const hiddenPhases = new Set(['start', 'research', 'design', 'decompose', 'propose']);
+                if (phase !== null && hiddenPhases.has(phase)) {
+                    return null;
+                }
+            }
+
+            if (message !== null && phase !== null) {
+                return message;
+            }
             return null;
         }
 
         case 'TOOL_USED': {
-            const toolName = typeof payload['toolName'] === 'string' ? payload['toolName'] : '';
             const source = typeof payload['source'] === 'string' ? payload['source'] : '';
-            const command = typeof payload['command'] === 'string' ? payload['command'] : '';
-            const filePath = typeof payload['filePath'] === 'string' ? payload['filePath'] : '';
 
-            // Code change events — show the filename
-            if (source === 'conductor:code_change' && filePath !== '') {
-                const fileName = filePath.split('/').pop() ?? filePath;
-                return `Modified ${fileName}`;
+            // Hide Claude Code internal tool calls — visible in Terminal tab
+            if (source.startsWith('conductor:')) return null;
+
+            // Show agent-level tool calls (QA probes, coordinator tools, researcher queries)
+            const toolName = typeof payload['toolName'] === 'string' ? payload['toolName'] : '';
+            const phase = typeof payload['phase'] === 'string' ? payload['phase'] : '';
+
+            if (phase === 'qa') {
+                // QA agent tool calls
+                if (toolName === 'http_get') {
+                    const input = payload['input'] as Record<string, unknown> | undefined;
+                    const url = typeof input?.['url'] === 'string' ? input['url'] : '';
+                    if (input?.['blocked'] === true) return `QA blocked: ${url} (port not mapped)`;
+                    return url !== '' ? `QA probing: ${url}` : 'QA running HTTP check';
+                }
+                if (toolName === 'execute_cli_command') {
+                    const input = payload['input'] as Record<string, unknown> | undefined;
+                    const cmd = typeof input?.['command'] === 'string' ? input['command'] : '';
+                    // Shorten docker exec prefix for readability
+                    const shortCmd = cmd.replace(/^docker exec \S+ sh -c /, '');
+                    return `QA running: ${shortCmd}`;
+                }
+                if (toolName === 'screenshot_url') return 'QA taking screenshot';
+                if (toolName === 'update_test_plan') return 'QA updating test plan';
+                if (toolName === 'submit_qa_verdict') return 'QA submitting verdict';
+                return `QA: ${toolName}`;
             }
 
-            // Tool result events — show status
-            if (source === 'conductor:tool_result') {
-                const status = typeof payload['status'] === 'string' ? payload['status'] : 'ok';
-                return status === 'error' ? 'Tool returned an error' : 'Tool completed';
-            }
+            // Other agent tool calls (coordinator, data researcher)
+            if (toolName === 'decompose_task') return 'Decomposing task into steps';
+            if (toolName === 'web_search' || toolName === 'query_rag') return `Researching: ${toolName}`;
+            return `${sourceId}: ${toolName}`;
+        }
 
-            if (toolName.includes('read') || toolName.includes('Read'))
-                return `Reading ${filePath !== '' ? filePath.split('/').pop() ?? 'file' : 'codebase'}...`;
-            if (toolName.includes('write') || toolName.includes('Write') || toolName.includes('Edit'))
-                return `Writing ${filePath !== '' ? filePath.split('/').pop() ?? 'file' : 'code'}...`;
-            if (command !== '' && command.includes('test'))
-                return 'Running tests...';
-            if (toolName.includes('Bash') || toolName.includes('bash')) {
-                const shortCmd = command.length > 40 ? `${command.slice(0, 40)}...` : command;
-                return shortCmd !== '' ? `Running: ${shortCmd}` : 'Running a command...';
-            }
-            return `Using tool: ${toolName}`;
+        case 'AGENT_SPAWNED': {
+            const role = typeof payload['role'] === 'string' ? payload['role'] : sourceId;
+            return `Agent started: ${role}`;
+        }
+
+        case 'AGENT_TERMINATED': {
+            const reason = typeof payload['reason'] === 'string' ? payload['reason'] : '';
+            return reason !== '' ? `Agent finished: ${reason}` : 'Agent finished';
         }
 
         case 'TASK_PLAN_CREATED':
@@ -108,8 +151,6 @@ export function translateEvent(event: SystemEvent): string | null {
         }
 
         // Hidden events — return null
-        case 'AGENT_SPAWNED':
-        case 'AGENT_TERMINATED':
         case 'MESSAGE_SENT':
         case 'CONDUCTOR_STREAM':
         case 'TOOL_REGISTERED':
@@ -118,6 +159,7 @@ export function translateEvent(event: SystemEvent): string | null {
         case 'RAG_STORE_CREATED':
         case 'CREDENTIAL_STORED':
         case 'CREDENTIAL_DELETED':
+        case 'SANDBOX_LOG':
             return null;
 
         default:
@@ -144,7 +186,10 @@ export function getActivityType(event: SystemEvent): 'info' | 'progress' | 'succ
         case 'TOOL_USED':
         case 'TASK_GRAPH_UPDATED':
         case 'TASK_PLAN_CREATED':
+        case 'AGENT_SPAWNED':
             return 'progress';
+        case 'AGENT_TERMINATED':
+            return 'info';
         default:
             return 'info';
     }

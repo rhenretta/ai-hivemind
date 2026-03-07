@@ -46,6 +46,7 @@ export interface FeatureState {
     setFeatureNeedsInput: (id: string, question: string, eventId: string) => void;
     clearFeatureNeedsInput: (id: string) => void;
     setFeatureDeployed: (id: string, route?: string) => void;
+    deleteFeature: (id: string) => void;
 }
 
 function countBlocked(features: Record<string, Feature>): number {
@@ -145,6 +146,12 @@ export const useFeatureStore = create<FeatureState>()((set) => ({
                 },
             };
             return { features, blockedCount: countBlocked(features) };
+        }),
+
+    deleteFeature: (id) =>
+        set((state) => {
+            const { [id]: _, ...remaining } = state.features;
+            return { features: remaining, blockedCount: countBlocked(remaining) };
         }),
 }));
 
