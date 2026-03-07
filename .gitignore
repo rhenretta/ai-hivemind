@@ -35,6 +35,8 @@ package-lock.json
 
 # SQLite database files
 data/
+*.sqlite
+**/.data/
 
 # Claude Code local settings
 .claude/settings.local.json
