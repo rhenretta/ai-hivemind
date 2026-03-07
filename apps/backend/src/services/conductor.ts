@@ -125,6 +125,12 @@ export class ConductorWrapper {
     /** Ports that have already had SERVICE_DEPLOYED emitted */
     seenPorts = new Set<number>();
 
+    /** Whether the startup banner has been shown (suppress duplicates from multiple system events) */
+    #bannerShown = false;
+
+    /** Session ID from Claude Code — used for `--resume` on retries */
+    sessionId: string | null = null;
+
     /** Active sandbox handle (when running in Docker isolation) */
     #sandbox: SandboxHandle | undefined;
 
@@ -159,6 +165,7 @@ export class ConductorWrapper {
     async runTask(prompt: string, sandbox?: SandboxHandle): Promise<void> {
         this.objective = prompt;
         this.#sawResult = false;
+        this.#bannerShown = false;
         this.messageBuffer = '';
         this.#sandbox = sandbox;
 
@@ -284,6 +291,12 @@ export class ConductorWrapper {
             const text = chunk.toString('utf8');
             if (text.trim().length > 0) {
                 console.warn(`[Conductor:${self.agentId}] stderr: ${text.trim().slice(0, 200)}`);
+                // Emit server log lines to the activity feed
+                for (const line of text.split('\n')) {
+                    if (line.trim().length > 0) {
+                        self.emit('SANDBOX_LOG', { text: line.trimEnd(), source: 'stderr' });
+                    }
+                }
             }
             self.detectDevServer(text);
         });
@@ -310,35 +323,235 @@ export class ConductorWrapper {
     }
 
     /**
-     * Run a full coding task with objective and acceptance criteria.
-     * In Claude Code, this is equivalent to runTask with a structured prompt —
-     * there is no separate "conductor track" concept.
+     * Run a full coding task. The `objective` from the orchestrator already
+     * contains acceptance criteria, design spec, and tech stack info.
+     * This method only adds execution-environment context (project root,
+     * sandbox info) — never duplicates what the orchestrator included.
      */
-    async runConductorTrack(objective: string, acceptanceCriteria: string, sandbox?: SandboxHandle): Promise<void> {
+    async runConductorTrack(objective: string, _acceptanceCriteria: string, sandbox?: SandboxHandle): Promise<void> {
         const projectRoot = sandbox?.workDir ?? MONOREPO_ROOT;
-        const taskDescription = [
+        const envContext = [
             objective,
             '',
-            '## Acceptance Criteria',
-            acceptanceCriteria,
-            '',
-            '## Project Root',
-            `All code files live at: ${projectRoot}`,
-            'When writing code files, use ABSOLUTE paths starting with the project root above.',
+            '## Environment',
+            `Project root: ${projectRoot}`,
+            'Use ABSOLUTE paths starting with the project root.',
             ...(sandbox !== undefined ? [
+                `You are inside an isolated Docker sandbox. Source at ${sandbox.workDir}.`,
+                'Dependencies are pre-installed. Changes merge back after QA.',
+                'IMPORTANT: Clear stale Next.js cache before building: rm -rf apps/web/.next',
                 '',
-                '## Sandbox Environment',
-                `You are working inside an isolated Docker container.`,
-                `The project source code is at ${sandbox.workDir}.`,
-                'All dependencies are pre-installed. You have full access to the filesystem inside the container.',
-                'Your changes will be merged back to the real codebase after QA passes.',
-                '',
-                '## Build Verification',
-                'Run `pnpm build` or `tsc` to verify your changes compile before finishing.',
+                '## Sandbox Port Configuration',
+                `The backend (Express) listens on port ${sandbox.backendPort.toString()} (env var PORT=${sandbox.backendPort.toString()}).`,
+                `The frontend (Next.js) reads WEB_PORT from env and starts on port ${sandbox.webPort.toString()}: just run \`pnpm --filter @ai-hivemind/web dev\` (no -p flag needed).`,
+                `The Next.js rewrites proxy is configured via BACKEND_PORT env var to forward /api/* to the backend on port ${sandbox.backendPort.toString()}.`,
+                'These are the ONLY ports available — do NOT use 3000 or 3001.',
             ] : []),
+            '',
+            '## API Architecture',
+            'The Next.js frontend proxies /api/* requests to the Express backend via rewrites in next.config.ts.',
+            'In frontend code, ALWAYS use relative paths for API calls: `fetch("/api/posts")`, `fetch("/api/weather")`.',
+            'NEVER hardcode any port number in frontend code — the proxy handles routing to the backend.',
+            '',
+            '## Using Available Services',
+            'When your task involves content analysis, classification, semantic filtering,',
+            'data enrichment, or any task that requires understanding meaning:',
+            '- Use the available external services listed in your objective (e.g., OpenAI for classification, Brave for search)',
+            '- Do NOT build keyword lists, regex patterns, or hardcoded rules as a substitute',
+            '  for proper API-based solutions when an appropriate service is available',
+            '- A 10-line API call to a classification service is better than a 100-line',
+            '  hardcoded heuristic — it is more accurate, more maintainable, and handles edge cases',
+            '',
+            '## MANDATORY: Debug properly — never guess',
+            'When something does not work (API calls fail, endpoints return errors, data is missing):',
+            '1. **Read the actual response** — `curl -v <url>` to see status code, headers, and body',
+            '2. **Check logs** — look at terminal output, stderr, and server logs for error messages',
+            '3. **Test in isolation** — run a minimal reproduction to confirm the root cause',
+            '4. **Fix the root cause** — do NOT just adjust timeouts, retries, or error handling to mask the problem',
+            '',
+            'Common pitfalls to avoid:',
+            '- If an API returns 403/429, read the error body — it usually tells you exactly what is wrong (missing User-Agent, auth, rate limit)',
+            '- If a fetch times out, that is a symptom, not the cause — find out WHY it times out before changing timeout values',
+            '- If data is empty, verify the request URL, headers, and query params are correct before adding fallback logic',
+            '- Graceful degradation is good, but only AFTER you have tried to make the happy path actually work',
+            '',
+            '## MANDATORY: Test your work end-to-end',
+            'Before finishing, you MUST verify the feature actually works:',
+            '- Start the dev server if not already running',
+            '- `curl` your API endpoints and confirm they return real data (not empty arrays or fallback responses)',
+            '- If the endpoint depends on an external API, verify the external call works (correct URL, headers, auth)',
+            '- If the feature has a frontend page, curl the page URL to ensure it compiles and serves',
+            '',
+            '## MANDATORY: Verify build before finishing',
+            'You MUST run `pnpm build` and confirm it succeeds BEFORE you consider your task done.',
+            'If the build fails, fix the errors and rebuild until it passes.',
+            'Do NOT finish with a broken build — QA will reject it.',
         ].join('\n');
 
-        return this.runTask(taskDescription, sandbox);
+        return this.runTask(envContext, sandbox);
+    }
+
+    /**
+     * Resume an existing Claude Code session with a follow-up prompt.
+     * Uses `--resume <sessionId> -p <prompt>` so Claude Code continues
+     * with its full previous context (files read, changes made) instead
+     * of starting from scratch.
+     *
+     * Falls back to a fresh runConductorTrack if no session ID is available.
+     */
+    async resumeWithFollowup(followup: string, sandbox?: SandboxHandle): Promise<void> {
+        if (this.sessionId === null) {
+            // No previous session — fall back to fresh run
+            return this.runConductorTrack(followup, '', sandbox);
+        }
+
+        const resumePrompt = [
+            followup,
+            '',
+            '## MANDATORY: Verify build before finishing',
+            'You MUST run `pnpm build` and confirm it succeeds BEFORE you consider your task done.',
+            'If the build fails, fix the errors and rebuild until it passes.',
+            'Do NOT finish with a broken build — QA will reject it.',
+        ].join('\n');
+
+        return this.runTaskWithResume(this.sessionId, resumePrompt, sandbox);
+    }
+
+    /**
+     * Run a task that resumes an existing Claude Code session.
+     * Claude Code keeps the full conversation context (files read,
+     * changes made) and appends the new prompt as a follow-up.
+     */
+    async runTaskWithResume(sessionId: string, prompt: string, sandbox?: SandboxHandle): Promise<void> {
+        this.objective = prompt;
+        this.#sawResult = false;
+        this.#bannerShown = false;
+        this.messageBuffer = '';
+        this.#sandbox = sandbox;
+
+        return new Promise<void>((resolve, reject) => {
+            let settled = false;
+
+            const timer = setTimeout(() => {
+                if (settled) return;
+                settled = true;
+                this.#taskResolve = null;
+                this.#taskReject = null;
+                this.process_?.kill('SIGTERM');
+                reject(new Error(`Conductor task timed out after ${(MAX_TASK_MS / 1000).toFixed(0)}s`));
+            }, MAX_TASK_MS);
+
+            this.#taskResolve = () => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                this.#taskResolve = null;
+                this.#taskReject = null;
+                resolve();
+            };
+
+            this.#taskReject = (err) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                this.#taskResolve = null;
+                this.#taskReject = null;
+                reject(err);
+            };
+
+            this.stream(prompt, 'in', 'input');
+            this.#spawnClaudeResume(sessionId, prompt, sandbox);
+        });
+    }
+
+    /**
+     * Spawn Claude Code with --resume to continue an existing session.
+     */
+    #spawnClaudeResume(sessionId: string, prompt: string, sandbox?: SandboxHandle): void {
+        authManager.ensureFreshToken();
+
+        const self = this;
+        const claudeArgs = [
+            '--resume', sessionId,
+            '-p', prompt,
+            '--output-format', 'stream-json',
+            '--verbose',
+            '--max-turns', MAX_TURNS.toString(),
+            '--dangerously-skip-permissions',
+        ];
+
+        let proc: ChildProcess;
+
+        if (sandbox !== undefined) {
+            console.log(`[Conductor:${self.agentId}] Resuming session=${sessionId} in container=${sandbox.containerName}`);
+            proc = execInSandbox(sandbox, CLAUDE_BIN, claudeArgs);
+        } else {
+            console.log(`[Conductor:${self.agentId}] Resuming session=${sessionId} directly`);
+            const childEnv: Record<string, string> = {};
+            const KEEP = ['PATH', 'HOME', 'USER', 'SHELL', 'TMPDIR', 'LANG', 'LC_ALL',
+                'SSH_AUTH_SOCK', 'XPC_FLAGS', 'XPC_SERVICE_NAME',
+                'COMMAND_MODE', 'LOGNAME', 'SHLVL', 'OLDPWD', 'PWD',
+                'NODE_ENV', 'NODE_OPTIONS', 'NVM_DIR', 'NVM_BIN'];
+            for (const key of KEEP) {
+                if (process.env[key] !== undefined) childEnv[key] = process.env[key]!;
+            }
+            if (process.env['ANTHROPIC_API_KEY']) {
+                childEnv['ANTHROPIC_API_KEY'] = process.env['ANTHROPIC_API_KEY'];
+            }
+            childEnv['DISABLE_AUTOUPDATER'] = '1';
+            childEnv['CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL'] = '1';
+            try {
+                Object.assign(childEnv, credentialStore.getDecryptedEnvVars());
+            } catch { /* Non-fatal */ }
+
+            proc = spawn(CLAUDE_BIN, claudeArgs, {
+                stdio: ['ignore', 'pipe', 'pipe'],
+                env: childEnv,
+                cwd: MONOREPO_ROOT,
+            });
+        }
+
+        self.process_ = proc;
+        self.processStdin_ = null;
+        let lineBuffer = '';
+
+        proc.stdout?.on('data', (chunk: Buffer) => {
+            lineBuffer += chunk.toString('utf8');
+            const lines = lineBuffer.split('\n');
+            lineBuffer = lines.pop() ?? '';
+            for (const line of lines) {
+                const trimmed = line.trim();
+                if (trimmed.length === 0) continue;
+                self.handleLine(trimmed);
+            }
+        });
+
+        proc.stderr?.on('data', (chunk: Buffer) => {
+            const text = chunk.toString('utf8');
+            if (text.trim().length > 0) {
+                console.warn(`[Conductor:${self.agentId}] stderr: ${text.trim().slice(0, 200)}`);
+                // Emit server log lines to the activity feed
+                for (const line of text.split('\n')) {
+                    if (line.trim().length > 0) {
+                        self.emit('SANDBOX_LOG', { text: line.trimEnd(), source: 'stderr' });
+                    }
+                }
+            }
+            self.detectDevServer(text);
+        });
+
+        proc.on('exit', (code: number | null) => {
+            self.processStdin_ = null;
+            self.process_ = null;
+            if (lineBuffer.trim().length > 0) self.handleLine(lineBuffer.trim());
+            if (self.messageBuffer.length > 0) self.flushMessageBuffer();
+            console.log(`[Conductor:${self.agentId}] Resume process exited code=${String(code)}`);
+            if (self.#sawResult || code === 0) {
+                self.#taskResolve?.();
+            } else {
+                self.#taskReject?.(new Error(`Claude Code exited (code ${String(code ?? 'null')}) before emitting a result`));
+            }
+        });
     }
 
 
@@ -386,6 +599,16 @@ export class ConductorWrapper {
 
         switch (ev.type) {
             case 'system': {
+                // Capture session ID for potential --resume on retries
+                if (ev.session_id !== undefined && typeof ev.session_id === 'string') {
+                    this.sessionId = ev.session_id;
+                }
+
+                // Claude Code emits multiple system events per session (init,
+                // api_key_source, etc.). Only show the banner once.
+                if (this.#bannerShown) break;
+                this.#bannerShown = true;
+
                 const model = ev.model ?? 'Claude';
                 const banner = [
                     '\n',
@@ -566,14 +789,6 @@ export class ConductorWrapper {
         this.messageBuffer = '';
     }
 
-    /** Rewrite a container-internal URL to the host-accessible URL using the port map. */
-    #rewriteUrl(url: string, containerPort: number): string {
-        if (this.#sandbox === undefined) return url;
-        const hostPort = this.#sandbox.portMap[containerPort];
-        if (hostPort === undefined) return url;
-        return url.replace(`:${containerPort.toString()}`, `:${hostPort.toString()}`);
-    }
-
     detectDevServer(stderr: string): void {
         const re = /https?:\/\/(localhost|127\.0\.0\.1):(\d+)/g;
         let match: RegExpExecArray | null;
@@ -581,7 +796,8 @@ export class ConductorWrapper {
             const port = parseInt(match[2] ?? '0', 10);
             if (port > 0 && !this.seenPorts.has(port)) {
                 this.seenPorts.add(port);
-                const url = this.#rewriteUrl(match[0], port);
+                // No port rewriting needed — sandbox uses 1:1 port mapping
+                const url = match[0];
                 const serviceName = `dev-server-${port.toString()}`;
                 this.emit('SERVICE_DEPLOYED', { serviceName, url, port });
             }
@@ -592,8 +808,7 @@ export class ConductorWrapper {
             const port = parseInt(stdoutMatch[2] ?? '0', 10);
             if (port > 0 && !this.seenPorts.has(port)) {
                 this.seenPorts.add(port);
-                const url = this.#rewriteUrl(stdoutMatch[0], port);
-                this.emit('SERVICE_DEPLOYED', { serviceName: `dev-server-${port.toString()}`, url, port });
+                this.emit('SERVICE_DEPLOYED', { serviceName: `dev-server-${port.toString()}`, url: stdoutMatch[0], port });
             }
         }
     }

@@ -24,6 +24,7 @@
 
 import { execSync, spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import fs from 'fs';
+import net from 'net';
 import os from 'os';
 import path from 'path';
 
@@ -54,10 +55,6 @@ const TAR_EXCLUDES = ['node_modules', 'dist', '.next', '.turbo', '.cache', '.git
 /** Patterns to skip when merging files back from container */
 const MERGE_SKIP = ['node_modules', 'dist', '.next', '.turbo', '.cache'];
 
-/** Container ports to expose for dev servers.
- *  Mapped to random host ports so QA can probe sandbox endpoints. */
-const EXPOSED_PORTS = [3000, 3001, 5173, 8000];
-
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export interface SandboxHandle {
@@ -65,8 +62,11 @@ export interface SandboxHandle {
     containerName: string;
     /** Working directory inside the container (always /workspace) */
     workDir: string;
-    /** Map of container port → host port for dev server access.
-     *  E.g. { 3000: 49152, 3001: 49153 } */
+    /** Port the Express backend listens on (same inside and outside container) */
+    backendPort: number;
+    /** Port the Next.js frontend listens on (same inside and outside container) */
+    webPort: number;
+    /** Legacy portMap for backward compat — keys === values (1:1 mapping) */
     portMap: Record<number, number>;
 }
 
@@ -74,6 +74,29 @@ export interface SandboxHandle {
 
 /** Map traceId → container name for idempotent lookups */
 const activeContainers = new Map<string, string>();
+
+// ── Port allocation ──────────────────────────────────────────────────────────
+
+/**
+ * Get a random available port by binding to port 0 and reading the OS-assigned port.
+ * The server is closed immediately, making the port available for Docker to bind.
+ */
+function getAvailablePort(): Promise<number> {
+    return new Promise((resolve, reject) => {
+        const server = net.createServer();
+        server.listen(0, '127.0.0.1', () => {
+            const addr = server.address();
+            if (addr === null || typeof addr === 'string') {
+                server.close();
+                reject(new Error('Failed to get available port'));
+                return;
+            }
+            const port = addr.port;
+            server.close(() => resolve(port));
+        });
+        server.on('error', reject);
+    });
+}
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -114,13 +137,13 @@ export function buildSandboxImage(): void {
  * Idempotent — safe to call multiple times with the same traceId.
  *
  * Steps:
- *   1. docker create with resource limits + no network
+ *   1. docker create with resource limits + port mapping
  *   2. docker start
  *   3. tar-pipe source code into /workspace/
  *
  * Returns a SandboxHandle with the container name and work directory.
  */
-export function createFeatureSandbox(traceId: string): SandboxHandle {
+export async function createFeatureSandbox(traceId: string): Promise<SandboxHandle> {
     const existing = activeContainers.get(traceId);
     if (existing !== undefined) {
         // Verify container still exists and get port map
@@ -128,7 +151,11 @@ export function createFeatureSandbox(traceId: string): SandboxHandle {
             execSync(`docker inspect ${existing}`, { stdio: 'pipe' });
             logger.info(`[SandboxManager] Reusing existing container for traceId=${traceId}`);
             const portMap = inspectPortMap(existing);
-            return { containerName: existing, workDir: CONTAINER_WORKDIR, portMap };
+            // Derive backendPort/webPort from portMap (1:1, so keys === values)
+            const ports = Object.keys(portMap).map(Number);
+            const backendPort = ports.find(p => portMap[p] === p && p !== ports[0]) ?? ports[1] ?? 3001;
+            const webPort = ports.find(p => p !== backendPort) ?? ports[0] ?? 3000;
+            return { containerName: existing, workDir: CONTAINER_WORKDIR, backendPort, webPort, portMap };
         } catch {
             // Container was removed externally — recreate
             activeContainers.delete(traceId);
@@ -144,7 +171,12 @@ export function createFeatureSandbox(traceId: string): SandboxHandle {
         // Container didn't exist — fine
     }
 
-    // 1. Create container with resource limits and port mapping
+    // Pick random available ports — same port inside and outside the container (1:1 mapping).
+    // This eliminates all port rewriting: host, container, QA, and frontend all use the same ports.
+    const backendPort = await getAvailablePort();
+    const webPort = await getAvailablePort();
+
+    // 1. Create container with resource limits and 1:1 port mapping
     const claudeConfigDir = path.join(os.homedir(), '.claude');
     const apiKey = process.env['ANTHROPIC_API_KEY'] ?? '';
 
@@ -156,11 +188,17 @@ export function createFeatureSandbox(traceId: string): SandboxHandle {
         '-w', CONTAINER_WORKDIR,
     ];
 
-    // Map common dev server ports to random host ports
-    // (0 = Docker picks an available host port)
-    for (const port of EXPOSED_PORTS) {
-        createArgs.push('-p', `0:${port.toString()}`);
-    }
+    // 1:1 port mapping — same port inside and outside
+    createArgs.push('-p', `${backendPort.toString()}:${backendPort.toString()}`);
+    createArgs.push('-p', `${webPort.toString()}:${webPort.toString()}`);
+
+    // Inject port env vars so apps listen on the correct ports
+    createArgs.push('-e', `PORT=${backendPort.toString()}`);
+    createArgs.push('-e', `BACKEND_PORT=${backendPort.toString()}`);
+    createArgs.push('-e', `WEB_PORT=${webPort.toString()}`);
+    // Tell the sandbox frontend where its own backend is (prevents it from
+    // connecting to the main site's backend on port 3001).
+    createArgs.push('-e', `NEXT_PUBLIC_NERVE_CENTER_URL=http://localhost:${backendPort.toString()}`);
 
     // Mount Claude auth config directory (contains backups, cache, session data).
     // Mounted to node user's home, not /root (container runs as non-root).
@@ -196,7 +234,7 @@ export function createFeatureSandbox(traceId: string): SandboxHandle {
 
     createArgs.push(SANDBOX_IMAGE, 'tail', '-f', '/dev/null');
 
-    logger.info(`[SandboxManager] Creating container ${containerName} for traceId=${traceId}`);
+    logger.info(`[SandboxManager] Creating container ${containerName} for traceId=${traceId} (backend=${backendPort.toString()}, web=${webPort.toString()})`);
     // Use spawnSync with array args to avoid shell escaping issues
     // (API key may contain special characters like $ or !)
     const createResult = spawnSync('docker', createArgs, { stdio: 'pipe' });
@@ -211,19 +249,60 @@ export function createFeatureSandbox(traceId: string): SandboxHandle {
     // 3. Inject source code via tar
     injectSourceCode(containerName);
 
-    // 4. Inject Claude OAuth credentials from macOS Keychain.
+    // 4. Inject .env.local into the container.
+    //    The backend dev script requires --env-file=../../.env.local (node crashes
+    //    with exit code 9 if the file is missing). We copy it separately from
+    //    ROOT_FILES so it's NOT included in merge-back (mergeFeatureSandbox).
+    const envLocalPath = path.join(MONOREPO_ROOT, '.env.local');
+    if (fs.existsSync(envLocalPath)) {
+        try {
+            execSync(
+                `docker cp "${envLocalPath}" ${containerName}:${CONTAINER_WORKDIR}/.env.local`,
+                { stdio: 'pipe', timeout: 5_000 },
+            );
+            // Fix ownership (docker cp writes as root)
+            execSync(
+                `docker exec --user 0 ${containerName} chown node:node ${CONTAINER_WORKDIR}/.env.local`,
+                { stdio: 'pipe', timeout: 5_000 },
+            );
+            logger.info('[SandboxManager] Injected .env.local into container');
+        } catch (e) {
+            logger.warn('[SandboxManager] Failed to inject .env.local:', e);
+        }
+    } else {
+        logger.debug('[SandboxManager] No .env.local found — backend dev script may fail');
+    }
+
+    // 5. Build packages/shared inside the container so .d.ts files exist.
+    //    Source injection copies source but tsbuildinfo can be stale (or absent),
+    //    causing incremental compilation to skip .d.ts generation. A clean build
+    //    here guarantees downstream packages (backend, web) can resolve types.
+    try {
+        execSync(
+            `docker exec ${containerName} sh -c "cd ${CONTAINER_WORKDIR}/packages/shared && rm -f tsconfig.tsbuildinfo && npx tsc -p tsconfig.json"`,
+            { stdio: 'pipe', timeout: 30_000 },
+        );
+        logger.info('[SandboxManager] Built packages/shared inside container');
+    } catch (e) {
+        logger.warn('[SandboxManager] Failed to build packages/shared:', e);
+    }
+
+    // 6. Inject Claude OAuth credentials from macOS Keychain.
     // On macOS, Claude Code stores creds in the Keychain and DELETES
     // ~/.claude/.credentials.json. On Linux (inside Docker), the CLI
     // reads from .credentials.json. We bridge this gap.
     injectClaudeCredentials(containerName);
 
-    // 4. Read the actual mapped host ports
-    const portMap = inspectPortMap(containerName);
+    // 7. Port map is 1:1 — same ports inside and outside
+    const portMap: Record<number, number> = {
+        [backendPort]: backendPort,
+        [webPort]: webPort,
+    };
 
     activeContainers.set(traceId, containerName);
-    logger.info(`[SandboxManager] Container ${containerName} ready (ports: ${JSON.stringify(portMap)})`);
+    logger.info(`[SandboxManager] Container ${containerName} ready (backend=${backendPort.toString()}, web=${webPort.toString()})`);
 
-    return { containerName, workDir: CONTAINER_WORKDIR, portMap };
+    return { containerName, workDir: CONTAINER_WORKDIR, backendPort, webPort, portMap };
 }
 
 /**
@@ -234,7 +313,11 @@ export function getFeatureSandbox(traceId: string): SandboxHandle | null {
     const containerName = activeContainers.get(traceId);
     if (containerName === undefined) return null;
     const portMap = inspectPortMap(containerName);
-    return { containerName, workDir: CONTAINER_WORKDIR, portMap };
+    // Derive ports from 1:1 portMap (keys === values)
+    const ports = Object.keys(portMap).map(Number);
+    const backendPort = ports[1] ?? 3001;
+    const webPort = ports[0] ?? 3000;
+    return { containerName, workDir: CONTAINER_WORKDIR, backendPort, webPort, portMap };
 }
 
 /**
@@ -340,14 +423,15 @@ export async function mergeFeatureSandbox(traceId: string): Promise<string[]> {
  * Called after merge completes (or on feature failure).
  */
 export function destroyFeatureSandbox(traceId: string): void {
-    const containerName = activeContainers.get(traceId);
-    if (containerName === undefined) return;
+    // Try in-memory lookup first, fall back to derived name (survives restarts)
+    const containerName = activeContainers.get(traceId)
+        ?? `${CONTAINER_PREFIX}${traceId.slice(0, 8)}`;
 
     try {
         execSync(`docker rm -f ${containerName}`, { stdio: 'pipe' });
         logger.info(`[SandboxManager] Destroyed container: ${containerName}`);
     } catch (e) {
-        logger.warn(`[SandboxManager] Failed to destroy container:`, e);
+        logger.warn(`[SandboxManager] Failed to destroy container ${containerName}:`, e);
     }
 
     activeContainers.delete(traceId);

@@ -49,7 +49,7 @@ export class SoftwareEngineer extends BaseAgent {
 
         this.spawn('swe-agent');
         this.emit('STATE_CHANGED', {
-            message: `Received coding objective: "${objective.slice(0, 120)}"`,
+            message: `Received coding objective: "${objective}"`,
             objective,
         });
 

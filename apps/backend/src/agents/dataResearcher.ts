@@ -33,6 +33,7 @@ Given a software objective, your job is to:
 2. If the objective involves external APIs or data sources, search for their documentation
 3. Identify which files in the existing project may need to be modified (describe paths you know exist based on the project structure)
 4. Identify relevant tech stack details, patterns, and constraints
+5. Analyze which of the available external services (listed in the objective under "Available External Services") are relevant to this task and recommend HOW they should be used — this is critical for guiding downstream implementation
 
 Output format (always return structured text under these exact headings):
 ## Prior Context
@@ -47,8 +48,14 @@ Output format (always return structured text under these exact headings):
 ## Constraints & Patterns
 (tech stack rules, naming conventions, patterns to follow)
 
+## Recommended Services
+(which available external services are relevant to this task and what role they should play.
+For example: "OpenAI could be used for semantic content classification" or "Brave Search could populate initial data."
+Be specific about WHAT the service would do and WHY it is better than a naive approach.
+If no available services apply, say "None — this is a purely internal task.")
+
 ## Summary
-(2-3 sentences synthesising the above for a planner)
+(2-3 sentences synthesising the above for a planner — include service recommendations)
 
 Guidelines:
 - Be concise — this output feeds directly into a planning prompt
@@ -102,7 +109,7 @@ export class DataResearcher extends BaseAgent {
     async run(objective: string): Promise<ResearchResult> {
         this.spawn('data-researcher');
         this.emit('STATE_CHANGED', {
-            message: `Researching: "${objective.slice(0, 120)}"`,
+            message: `Researching: "${objective}"`,
             phase: 'research',
         });
 
@@ -158,10 +165,10 @@ export class DataResearcher extends BaseAgent {
 
         // Extract the summary section
         const summaryMatch = /## Summary\s*([\s\S]+)$/m.exec(fullReport);
-        const summary = summaryMatch?.[1]?.trim() ?? fullReport.slice(0, 400);
+        const summary = summaryMatch?.[1]?.trim() ?? fullReport;
 
         this.emit('STATE_CHANGED', {
-            message: `Research complete. Summary: ${summary.slice(0, 200)}`,
+            message: `Research complete. Summary: ${summary}`,
             phase: 'research',
             done: true,
         });

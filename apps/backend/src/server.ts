@@ -5,15 +5,16 @@ import cors from 'cors';
 import express, { type Application, type Request, type Response } from 'express';
 import { Server, type Socket } from 'socket.io';
 
-import { Coordinator } from './agents/coordinator.js';
+import { ProjectManager } from './agents/projectManager.js';
 import { eventBus } from './eventBus.js';
 // Services — import triggers singleton creation + built-in tool seeding
 import { credentialStore } from './services/credentialStore.js';
+import { classifyIntent, getFeatureSummaries, getRecentChatMessages } from './services/intentRouter.js';
 import { logger } from './services/logger.js';
 import { mcpRegistry } from './services/mcpRegistry.js';
 import { ragStore } from './services/ragStore.js';
 import { mergeFeatureSandbox, destroyFeatureSandbox } from './services/sandboxManager.js';
-// Agent roster — Coordinator bootstraps on USER_COMMAND events
+// Agent roster — ProjectManager bootstraps on USER_COMMAND events
 
 /**
  * Nerve Center HTTP + WebSocket Server
@@ -301,6 +302,88 @@ io.on('connection', (socket: Socket) => {
         });
     });
 
+    // ── Intent-routed messages ────────────────────────────────────────────
+    //
+    // The ChatInput sends 'user:message' with raw text (no traceId).
+    // The intent router classifies it and either creates a new feature,
+    // continues an existing one, or provides input to a blocked feature.
+    socket.on('user:message', (data: {
+        text: string;
+        clientEventId: string;
+    }) => {
+        const { text, clientEventId } = data;
+        logger.info(`[Nerve Center] user:message from socket=${socket.id} | text="${text.slice(0, 80)}…"`);
+
+        void (async () => {
+            try {
+                const features = getFeatureSummaries();
+                const recentMessages = getRecentChatMessages(10);
+                const result = await classifyIntent(text, features, recentMessages);
+
+                const traceId = result.intent === 'new_feature'
+                    ? crypto.randomUUID()
+                    : result.targetTraceId!;
+
+                // Acknowledge to frontend — links the optimistic message to a feature
+                socket.emit('intent:resolved', {
+                    clientEventId,
+                    traceId,
+                    intent: result.intent,
+                    reasoning: result.reasoning,
+                });
+
+                if (result.intent === 'provide_input') {
+                    eventBus.emit({
+                        eventId: crypto.randomUUID(),
+                        timestamp: new Date().toISOString(),
+                        eventType: 'USER_INTERVENTION',
+                        sourceId: 'user',
+                        targetId: 'conductor',
+                        traceId,
+                        payload: { text, targetId: 'conductor' },
+                    });
+                } else {
+                    // new_feature or continue_feature
+                    eventBus.emit({
+                        eventId: clientEventId,
+                        timestamp: new Date().toISOString(),
+                        eventType: 'USER_COMMAND',
+                        sourceId: 'user',
+                        targetId: null,
+                        traceId,
+                        payload: {
+                            objective: result.enrichedObjective,
+                            traceId,
+                            originalText: text,
+                            intent: result.intent,
+                        },
+                    });
+                }
+            } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                logger.error(`[Nerve Center] user:message classification failed: ${msg}`);
+
+                // Fallback: treat as new feature
+                const traceId = crypto.randomUUID();
+                socket.emit('intent:resolved', {
+                    clientEventId,
+                    traceId,
+                    intent: 'new_feature',
+                    reasoning: 'Fallback due to classification error',
+                });
+                eventBus.emit({
+                    eventId: clientEventId,
+                    timestamp: new Date().toISOString(),
+                    eventType: 'USER_COMMAND',
+                    sourceId: 'user',
+                    targetId: null,
+                    traceId,
+                    payload: { objective: text, traceId, originalText: text, intent: 'new_feature' },
+                });
+            }
+        })();
+    });
+
     socket.on('user:intervention', (data: {
         text: string;
         targetId: string;
@@ -317,6 +400,28 @@ io.on('connection', (socket: Socket) => {
             targetId,
             traceId,
             payload: { text, targetId },
+        });
+    });
+
+    socket.on('user:delete-feature', (data: { traceId: string }) => {
+        const { traceId } = data;
+        logger.info(`[Nerve Center] user:delete-feature from socket=${socket.id} | traceId=${traceId}`);
+
+        // Destroy sandbox if one exists
+        try {
+            destroyFeatureSandbox(traceId);
+        } catch {
+            // Sandbox may not exist — that's fine
+        }
+
+        eventBus.emit({
+            eventId: crypto.randomUUID(),
+            timestamp: new Date().toISOString(),
+            eventType: 'FEATURE_DELETED',
+            sourceId: 'user',
+            targetId: null,
+            traceId,
+            payload: {},
         });
     });
 
@@ -366,17 +471,17 @@ eventBus.subscribeAll((event: SystemEvent) => {
     io.emit('system:event', event);
 });
 
-// ─── Agentic Core — USER_COMMAND → Coordinator ────────────────────────────────
+// ─── Agentic Core — USER_COMMAND → ProjectManager ─────────────────────────────
 
 /**
  * Listen for USER_COMMAND events on the EventBus.
  *
  * When a command arrives (injected via /api/events/inject or a future Socket.io
- * message from the Command Center), instantiate the Coordinator and kick off
- * the agentic run loop.
+ * message from the Command Center), instantiate the ProjectManager and kick off
+ * the RPIV pipeline (Research → Design → Decompose → Execute).
  *
  * Execution is non-blocking — the HTTP/WebSocket server continues serving
- * requests while the Coordinator works asynchronously.
+ * requests while the ProjectManager works asynchronously.
  *
  * Errors in the run loop are caught here; a crash in one run never takes down
  * the server or prevents future commands from being processed.
@@ -391,9 +496,10 @@ eventBus.subscribe('USER_COMMAND', (event: SystemEvent) => {
 
     logger.info(`[Nerve Center] USER_COMMAND received | traceId=${traceId} | objective="${objective.slice(0, 80)}…"`);
 
-    // Fire-and-forget — Coordinator manages its own error handling
-    void new Coordinator(traceId).run(objective).catch((err: unknown) => {
+    // Fire-and-forget — ProjectManager manages its own error handling
+    const pmId = `project-manager.${crypto.randomUUID().slice(0, 8)}`;
+    void new ProjectManager(pmId, traceId).run(objective).catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
-        logger.error(`[Nerve Center] Coordinator run failed for traceId=${traceId}: ${msg}`);
+        logger.error(`[Nerve Center] ProjectManager run failed for traceId=${traceId}: ${msg}`);
     });
 });

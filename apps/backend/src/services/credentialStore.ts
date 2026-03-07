@@ -20,6 +20,8 @@ import {
 } from '@ai-hivemind/shared';
 import BetterSqlite3 from 'better-sqlite3';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { v4 as uuidv4 } from 'uuid';
 
 import { eventBus } from '../eventBus.js';
@@ -29,6 +31,15 @@ import { logger } from './logger.js';
 // ─── Database initialisation ─────────────────────────────────────────────────
 
 const DB_PATH = process.env['CREDENTIAL_DB_PATH'] ?? ':memory:';
+
+// Ensure parent directory exists (like ledgerStore does)
+if (DB_PATH !== ':memory:') {
+    const dir = path.dirname(DB_PATH);
+    if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+    }
+}
+
 const db = new BetterSqlite3(DB_PATH);
 
 db.exec(`

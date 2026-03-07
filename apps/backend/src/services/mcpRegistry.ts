@@ -216,12 +216,13 @@ const BUILT_IN_TOOLS: McpTool[] = [
     ),
     makeBuiltIn(
         'screenshot_url',
-        'Take a full-page screenshot of a URL using Playwright (headless Chromium) and return the image as a base64-encoded PNG. Returns [PLAYWRIGHT_UNAVAILABLE] if Playwright is not installed.',
+        'Take a full-page screenshot of a URL using Playwright (headless Chromium) and return the image as a base64-encoded PNG. Waits for the page to load AND an extra delay for async JS rendering. Returns [PLAYWRIGHT_UNAVAILABLE] if Playwright is not installed.',
         {
             type: 'object',
             properties: {
                 url: { type: 'string', format: 'uri', description: 'URL to screenshot' },
                 timeout_ms: { type: 'number', description: 'Page load timeout in milliseconds', default: 15000 },
+                wait_after_load_ms: { type: 'number', description: 'Extra delay (ms) after page load event before capturing — lets async JS/React finish rendering. Default 3000.', default: 3000 },
             },
             required: ['url'],
         },

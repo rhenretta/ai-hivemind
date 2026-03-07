@@ -225,30 +225,38 @@ async function writeFileTool(filePath: string, content: string, append = false):
 /**
  * screenshot_url — take a headless Playwright screenshot, return base64 PNG.
  * Returns '[PLAYWRIGHT_UNAVAILABLE] <reason>' on failure so QA can degrade gracefully.
+ *
+ * @param waitAfterLoadMs — Extra delay (ms) after the page `load` event before
+ *   capturing. This lets client-side React/Next.js apps finish async data fetches
+ *   so the screenshot shows real content instead of a loading spinner.
+ *   Default: 3000ms (3 seconds).
  */
-async function screenshotUrl(url: string, timeoutMs = 15_000): Promise<string> {
+async function screenshotUrl(url: string, timeoutMs = 15_000, waitAfterLoadMs = 3_000): Promise<string> {
     const outPath = resolve(tmpdir(), `qa-screenshot-${randomUUID()}.png`);
     try {
         // Use npx so Playwright doesn't need to be globally installed.
         // --timeout controls the page-load wait; --full-page captures the entire scroll height.
+        // --wait-for-timeout adds a delay AFTER page load for async JS to finish rendering.
         const cmd = [
             'npx', '--yes', 'playwright', 'screenshot',
             '--browser', 'chromium',
             '--full-page',
-            `--timeout`, String(timeoutMs),
+            '--timeout', String(timeoutMs),
+            '--wait-for-timeout', String(waitAfterLoadMs),
             url,
             outPath,
         ].join(' ');
 
+        const totalTimeout = timeoutMs + waitAfterLoadMs + 10_000;
         await withTimeout(
-            execAsync(cmd, { timeout: timeoutMs + 10_000 }),
-            timeoutMs + 12_000,
+            execAsync(cmd, { timeout: totalTimeout }),
+            totalTimeout + 2_000,
             'screenshot_url',
         );
 
         const png = await readFile(outPath);
         const b64 = png.toString('base64');
-        logger.info(`[MCP Executor] Screenshot captured for ${url} (${png.length.toString()} bytes)`);
+        logger.info(`[MCP Executor] Screenshot captured for ${url} (${png.length.toString()} bytes, waited ${waitAfterLoadMs.toString()}ms after load)`);
         return b64;
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -309,7 +317,8 @@ export async function executeTool(
             case 'screenshot_url': {
                 const url = String(args['url'] ?? '');
                 const timeout = typeof args['timeout_ms'] === 'number' ? args['timeout_ms'] : 15_000;
-                return await screenshotUrl(url, timeout);
+                const waitAfterLoad = typeof args['wait_after_load_ms'] === 'number' ? args['wait_after_load_ms'] : 3_000;
+                return await screenshotUrl(url, timeout, waitAfterLoad);
             }
 
             default:
