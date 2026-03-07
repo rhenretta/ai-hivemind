@@ -14,6 +14,7 @@ export function QaVerdictRenderer({ event }: QaVerdictRendererProps) {
     const subtask = typeof event.payload['subtask'] === 'string' ? event.payload['subtask'] : '';
     const issues = Array.isArray(event.payload['issues']) ? (event.payload['issues'] as string[]) : [];
     const summary = typeof event.payload['summary'] === 'string' ? event.payload['summary'] : '';
+    const stepsToReproduce = Array.isArray(event.payload['stepsToReproduce']) ? (event.payload['stepsToReproduce'] as string[]) : [];
     const testPlan = event.payload['testPlan'] as { tests: { id: string; name: string; description?: string; type: string; status: string; result?: string }[] } | undefined;
 
     return (
@@ -46,6 +47,19 @@ export function QaVerdictRenderer({ event }: QaVerdictRendererProps) {
                         </li>
                     ))}
                 </ul>
+            )}
+
+            {!passed && stepsToReproduce.length > 0 && (
+                <div className="pl-6 space-y-1">
+                    <p className="text-[11px] font-medium text-orange-300/80">Steps to reproduce:</p>
+                    <ol className="space-y-0.5 pl-1">
+                        {stepsToReproduce.map((step, i) => (
+                            <li key={i} className="text-[11px] text-foreground/50 font-mono whitespace-pre-wrap break-words">
+                                {step}
+                            </li>
+                        ))}
+                    </ol>
+                </div>
             )}
 
             {summary !== '' && (

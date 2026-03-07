@@ -223,9 +223,14 @@ const QA_OPENAI_TOOLS: OpenAI.ChatCompletionTool[] = [
                         items: { type: 'string' },
                         description: 'Specific, actionable issues found (empty array if passed)',
                     },
+                    stepsToReproduce: {
+                        type: 'array',
+                        items: { type: 'string' },
+                        description: 'Ordered steps the SWE can follow to reproduce each issue (e.g., "1. Start backend: pnpm --filter @ai-hivemind/backend dev", "2. GET http://localhost:3001/api/posts", "3. Observe: response is empty array []"). Empty array if passed.',
+                    },
                     summary: { type: 'string', description: 'Comprehensive test report summarizing all findings' },
                 },
-                required: ['passed', 'issues', 'summary'],
+                required: ['passed', 'issues', 'stepsToReproduce', 'summary'],
             },
         },
     },
@@ -366,6 +371,8 @@ what you expected, and what you actually got. Vague results like "it didn't work
 After ALL tests are complete (no pending or running tests), call **submit_qa_verdict** with:
 - \`passed\`: true only if ALL tests passed (or non-critical ones are skipped with good reason)
 - \`issues\`: specific, actionable issues the SWE can fix (empty if passed)
+- \`stepsToReproduce\`: ordered steps the SWE can follow to reproduce each failure (empty if passed).
+  Write these as numbered CLI commands and observations so the SWE can copy-paste them to verify the fix.
 - \`summary\`: comprehensive report of everything you tested and found
 
 IMPORTANT RULES:
@@ -417,7 +424,18 @@ GOOD (specific — ALWAYS write issues like these):
   - "GET http://localhost:54372/api/posts returned HTTP 200 but body is empty array [] — expected non-empty array with title, author, score fields"
   - "Screenshot of http://localhost:54372/doomscroll shows unstyled HTML — no Tailwind classes on main container, expected centered single-column layout"
   - "PostCard component missing from /doomscroll — page shows raw JSON in <pre> tag instead of styled card components"
-Each issue must include: the URL you probed, what you expected, and what you actually found.`;
+Each issue must include: the URL you probed, what you expected, and what you actually found.
+
+STEPS TO REPRODUCE — when the verdict fails, provide an ordered list the SWE can follow:
+BAD (too vague):
+  - "Start the server and check the endpoint"
+GOOD (copy-pasteable):
+  - "1. cd /workspace && pnpm --filter @ai-hivemind/backend dev"
+  - "2. Wait 3 seconds for server to start"
+  - "3. curl http://localhost:3001/api/reddit/posts"
+  - "4. Observe: response is empty array [] — expected non-empty array of filtered posts"
+  - "5. curl http://localhost:3001/health → returns 200 OK, so the server is running"
+The SWE should be able to paste these commands to verify the fix works.`;
 
     if (isSandboxMode) {
         const { backendPort, webPort } = sandbox!;
@@ -507,6 +525,8 @@ export interface QaVerdict {
     visualDescription: string;
     /** Comprehensive test report summarizing findings */
     summary?: string;
+    /** Ordered steps to reproduce failures — gives the SWE a clear repro path */
+    stepsToReproduce?: string[];
     /** Final state of the QA test plan */
     testPlan?: QaTestPlan;
 }
@@ -524,7 +544,7 @@ export class QaEngineer extends BaseAgent {
     #verdictSubmitted = false;
 
     /** Verdict args stored when submit_qa_verdict is called */
-    #pendingVerdict: { passed: boolean; issues: string[]; summary: string } | null = null;
+    #pendingVerdict: { passed: boolean; issues: string[]; stepsToReproduce: string[]; summary: string } | null = null;
 
     constructor(agentId: string, traceId: string) {
         super(agentId, traceId);
@@ -667,7 +687,7 @@ export class QaEngineer extends BaseAgent {
         // TS control-flow analysis can't track mutations via #handleSubmitVerdict()
         // (called indirectly through #dispatchTool), so it narrows #verdictSubmitted
         // to `false` and #pendingVerdict to `null`. Widen with type assertions.
-        const pv = this.#pendingVerdict as { passed: boolean; issues: string[]; summary: string } | null;
+        const pv = this.#pendingVerdict as { passed: boolean; issues: string[]; stepsToReproduce: string[]; summary: string } | null;
         if ((this.#verdictSubmitted as boolean) && pv !== null) {
             const plan = this.#testPlan as QaTestPlan | null;
             verdict = {
@@ -682,6 +702,7 @@ export class QaEngineer extends BaseAgent {
                         .join('; ') || 'N/A'
                     : 'N/A',
                 summary: pv.summary,
+                ...(pv.stepsToReproduce.length > 0 ? { stepsToReproduce: pv.stepsToReproduce } : {}),
                 ...(plan !== null ? { testPlan: plan } : {}),
             };
         }
@@ -694,6 +715,7 @@ export class QaEngineer extends BaseAgent {
             checksRun: verdict.checksRun,
             visualDescription: verdict.visualDescription,
             summary: verdict.summary,
+            stepsToReproduce: verdict.stepsToReproduce,
             testPlan: verdict.testPlan,
             artifactSuccess: artifact.success,
             filesChanged: artifact.filesChanged.length,
@@ -963,6 +985,7 @@ export class QaEngineer extends BaseAgent {
     #handleSubmitVerdict(args: Record<string, unknown>): string {
         const passed = args['passed'] === true;
         const issues = Array.isArray(args['issues']) ? (args['issues'] as unknown[]).map(String) : [];
+        const stepsToReproduce = Array.isArray(args['stepsToReproduce']) ? (args['stepsToReproduce'] as unknown[]).map(String) : [];
         const summary = typeof args['summary'] === 'string' ? args['summary'] : '';
 
         // Validate: no tests should be pending or running
@@ -976,7 +999,7 @@ export class QaEngineer extends BaseAgent {
         }
 
         this.#verdictSubmitted = true;
-        this.#pendingVerdict = { passed, issues, summary };
+        this.#pendingVerdict = { passed, issues, stepsToReproduce, summary };
 
         // Emit as TOOL_USED so the activity log shows this action
         this.emit('TOOL_USED', {
