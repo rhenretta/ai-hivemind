@@ -37,3 +37,9 @@ export * from './types/taskGraph.js';
 
 // ─── Credential Store ────────────────────────────────────────────────────────
 export * from './types/credentials.js';
+
+// ─── UX Design Spec ─────────────────────────────────────────────────────────
+export * from './types/uxDesign.js';
+
+// ─── QA Test Plan ───────────────────────────────────────────────────────────
+export * from './types/qaTestPlan.js';

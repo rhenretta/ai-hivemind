@@ -21,6 +21,9 @@ export const TaskStatusSchema = z.enum([
 ]);
 export type TaskStatus = z.infer<typeof TaskStatusSchema>;
 
+export const TaskTypeSchema = z.enum(['frontend', 'backend', 'fullstack']);
+export type TaskType = z.infer<typeof TaskTypeSchema>;
+
 export const TaskNodeSchema = z.object({
     /** Unique identifier within this graph, e.g. "task-1", "task-2.3" */
     id: z.string(),
@@ -42,6 +45,14 @@ export const TaskNodeSchema = z.object({
      * false → composite: decompose further with a child TaskOrchestrator
      */
     isAtomic: z.boolean(),
+
+    /**
+     * What kind of work this node does — used to filter context:
+     *   'frontend'  → gets UX design spec, no backend-only docs
+     *   'backend'   → gets API/service context, no design spec
+     *   'fullstack' → gets everything
+     */
+    taskType: TaskTypeSchema.default('fullstack'),
 
     /** Human-readable result summary, set on completion */
     result: z.string().optional(),

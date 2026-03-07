@@ -98,6 +98,16 @@ export const SystemEventTypeSchema = z.enum([
      * Payload: { routes: string[], filesChanged: string[] }
      */
     'FEATURE_DEPLOYED',
+    /**
+     * A feature was deleted by the user. Sandbox is destroyed, feature removed from UI.
+     * Payload: { reason?: string }
+     */
+    'FEATURE_DELETED',
+    /**
+     * Real-time server log output from a sandbox container.
+     * Payload: { text: string, source: 'stdout' | 'stderr' | 'backend' | 'frontend' }
+     */
+    'SANDBOX_LOG',
 ]);
 export type SystemEventType = z.infer<typeof SystemEventTypeSchema>;
 
