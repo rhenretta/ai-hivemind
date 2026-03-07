@@ -222,7 +222,7 @@ const BUILT_IN_TOOLS: McpTool[] = [
             properties: {
                 url: { type: 'string', format: 'uri', description: 'URL to screenshot' },
                 timeout_ms: { type: 'number', description: 'Page load timeout in milliseconds', default: 15000 },
-                wait_after_load_ms: { type: 'number', description: 'Extra delay (ms) after page load event before capturing — lets async JS/React finish rendering. Default 3000.', default: 3000 },
+                wait_after_load_ms: { type: 'number', description: 'Extra delay (ms) after page load event before capturing — lets async JS/React finish rendering. Default 3000. Use 15000-30000 for pages that fetch from slow APIs (external services, AI processing). Use 45000-60000 for pages with chained API calls (e.g. fetch → AI filter → render).', default: 3000 },
             },
             required: ['url'],
         },

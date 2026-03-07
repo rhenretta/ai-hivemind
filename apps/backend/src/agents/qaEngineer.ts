@@ -348,14 +348,29 @@ You have 5 tools available:
 - **screenshot_url** — Take Playwright screenshots (waits 3s after page load by default for async data)
 
 ### Timeout Guidelines
-Set \`timeout_ms\` based on what the endpoint DOES — don't use the default 10s for everything:
-- **Health checks, static routes:** 10000 (10s) — default is fine
-- **Database queries, simple CRUD:** 15000 (15s)
-- **External API calls (Reddit, Twitter, etc.):** 30000-45000 (30-45s) — network round-trip to third-party
-- **AI/LLM processing (OpenAI, sentiment analysis, etc.):** 45000-60000 (45-60s) — LLM inference is slow
-- **Chained calls (fetch + AI filter + transform):** 60000 (60s) — multiple slow operations in sequence
-Read the SUBTASK and SWE ARTIFACT to understand what the endpoint does, then choose accordingly.
-A timeout is NOT a failure of the code — it may just mean you didn't wait long enough.
+Think about the FULL call chain before choosing timeouts. Read the SUBTASK and SWE ARTIFACT to understand
+what happens when a request is made, then set timeouts accordingly.
+
+**http_get \`timeout_ms\`** (default 10s):
+| Endpoint type | timeout_ms | Why |
+|---|---|---|
+| Health checks, static routes | 10000 | No processing |
+| Database queries, simple CRUD | 15000 | DB round-trip |
+| External API calls (Reddit, Twitter) | 30000-45000 | Network to third-party |
+| AI/LLM processing (OpenAI, sentiment) | 45000-60000 | LLM inference is slow |
+| Chained: fetch → AI filter → transform | 60000 | Multiple slow operations |
+
+**screenshot_url \`wait_after_load_ms\`** (default 3s) — same logic, but for the ENTIRE page render chain:
+The page loads instantly (HTML), then makes fetch() calls. \`wait_after_load_ms\` must cover the fetch + render.
+| Page fetches from... | wait_after_load_ms | Why |
+|---|---|---|
+| Static data / local state | 3000 | Default is fine |
+| Simple backend DB query | 10000 | DB + render |
+| External API (Reddit, etc.) | 30000 | API round-trip + render |
+| AI-powered endpoint (OpenAI filter) | 45000-60000 | LLM + render |
+
+A timeout is NOT a failure of the code — it may mean you didn't wait long enough. Always try a generous
+timeout FIRST, especially for pages that depend on slow backends.
 
 ### Phase 1: Plan Your Tests
 Analyze the SWE artifact, acceptance criteria, ${hasDesign ? 'design spec, ' : ''}and available endpoints.
@@ -395,10 +410,15 @@ IMPORTANT RULES:
 - Unstyled HTML (raw browser defaults, no CSS) is an AUTOMATIC FAIL
 - Do NOT re-run pnpm build — the SWE already verified compilation. Focus on runtime behavior.
 
-NOTE: screenshot_url automatically waits 3 seconds after page load for async data to render.
-If the screenshot STILL shows a loading spinner/skeleton:
-  1. Retry with a longer wait: screenshot_url { "url": "...", "wait_after_load_ms": 8000 }
-  2. If it STILL shows loading, mark the visual test as FAILED.
+NOTE ON SCREENSHOTS: screenshot_url waits \`wait_after_load_ms\` (default 3s) AFTER the page loads for async
+data to render. Apply the SAME timeout reasoning as http_get — if the page fetches from a slow backend:
+  - Page fetching from a simple DB query: wait_after_load_ms: 10000
+  - Page fetching from external APIs (Reddit, etc.): wait_after_load_ms: 30000
+  - Page fetching from AI-powered endpoints (OpenAI filtering, etc.): wait_after_load_ms: 45000-60000
+  Think about what happens when the page loads: it makes a fetch() call to the backend, which may call
+  external services. The screenshot wait must cover the ENTIRE chain.
+If the screenshot shows a loading spinner, FIRST check if you used a long enough wait. Retry with a
+longer wait_after_load_ms BEFORE marking the test as failed. Only fail after trying a generous wait.
 
 BAD TEST PLAN (never do this):
   [{ id: "check-all", name: "Check everything", description: "Test the whole feature", ... }]
