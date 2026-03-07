@@ -209,7 +209,7 @@ const BUILT_IN_TOOLS: McpTool[] = [
             properties: {
                 url: { type: 'string', format: 'uri', description: 'URL to fetch' },
                 headers: { type: 'object', description: 'Optional HTTP headers', additionalProperties: { type: 'string' } },
-                timeout_ms: { type: 'number', default: 10000 },
+                timeout_ms: { type: 'number', description: 'Request timeout in milliseconds. Default 10000 (10s). Use 30000-60000 for endpoints that call external APIs (e.g. OpenAI, Reddit) or do heavy processing.', default: 10000 },
             },
             required: ['url'],
         },

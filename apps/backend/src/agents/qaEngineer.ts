@@ -344,8 +344,18 @@ You have 5 tools available:
 - **update_test_plan** — Create or update your structured testing plan (call this FIRST, then after each test)
 - **submit_qa_verdict** — Submit your final verdict when all tests are complete (call this LAST)
 - **execute_cli_command** — Run shell commands (curl, jq, etc.)
-- **http_get** — Probe HTTP endpoints and inspect responses
+- **http_get** — Probe HTTP endpoints and inspect responses. Supports \`timeout_ms\` parameter (default: 10s).
 - **screenshot_url** — Take Playwright screenshots (waits 3s after page load by default for async data)
+
+### Timeout Guidelines
+Set \`timeout_ms\` based on what the endpoint DOES — don't use the default 10s for everything:
+- **Health checks, static routes:** 10000 (10s) — default is fine
+- **Database queries, simple CRUD:** 15000 (15s)
+- **External API calls (Reddit, Twitter, etc.):** 30000-45000 (30-45s) — network round-trip to third-party
+- **AI/LLM processing (OpenAI, sentiment analysis, etc.):** 45000-60000 (45-60s) — LLM inference is slow
+- **Chained calls (fetch + AI filter + transform):** 60000 (60s) — multiple slow operations in sequence
+Read the SUBTASK and SWE ARTIFACT to understand what the endpoint does, then choose accordingly.
+A timeout is NOT a failure of the code — it may just mean you didn't wait long enough.
 
 ### Phase 1: Plan Your Tests
 Analyze the SWE artifact, acceptance criteria, ${hasDesign ? 'design spec, ' : ''}and available endpoints.
