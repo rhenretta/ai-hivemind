@@ -37,7 +37,7 @@ function getClient(): OpenAI {
         if (apiKey === undefined || apiKey === '' || apiKey === 'sk-...') {
             throw new Error(
                 '[LLM] OPENAI_API_KEY is not set. ' +
-                'Add it to .env.local to enable the Coordinator agent. ' +
+                'Add it via the Settings page (credential store) or .env.local. ' +
                 'The server will continue operating without LLM capabilities.',
             );
         }

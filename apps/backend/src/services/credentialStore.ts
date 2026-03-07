@@ -267,7 +267,7 @@ class CredentialStore {
     /**
      * Returns decrypted env var pairs for sandbox injection.
      * This is the ONLY method that exposes plaintext values.
-     * Called exclusively by sandboxManager and conductor.
+     * Called by sandboxManager, conductor, and hydrateProcessEnv.
      */
     getDecryptedEnvVars(): Record<string, string> {
         const rows = stmtSelectAll.all() as CredentialRow[];
@@ -280,6 +280,30 @@ class CredentialStore {
             }
         }
         return envVars;
+    }
+
+    /**
+     * Hydrate process.env with stored credentials.
+     * Called once at backend startup so services like llm.ts can read API keys
+     * via process.env without needing direct credential store access.
+     * Only sets vars that are NOT already set (env vars take precedence).
+     */
+    hydrateProcessEnv(): void {
+        try {
+            const vars = this.getDecryptedEnvVars();
+            let count = 0;
+            for (const [key, value] of Object.entries(vars)) {
+                if (process.env[key] === undefined || process.env[key] === '') {
+                    process.env[key] = value;
+                    count++;
+                }
+            }
+            if (count > 0) {
+                logger.info(`[CredentialStore] Hydrated ${count.toString()} env var(s) from credential store`);
+            }
+        } catch (err) {
+            logger.warn(`[CredentialStore] Failed to hydrate process.env: ${String(err)}`);
+        }
     }
 }
 

@@ -252,17 +252,19 @@ export class ConductorWrapper {
             for (const key of KEEP) {
                 if (process.env[key] !== undefined) childEnv[key] = process.env[key]!;
             }
-            if (process.env['ANTHROPIC_API_KEY']) {
-                childEnv['ANTHROPIC_API_KEY'] = process.env['ANTHROPIC_API_KEY'];
-            }
             childEnv['DISABLE_AUTOUPDATER'] = '1';
             childEnv['CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL'] = '1';
 
-            // Inject user-configured service credentials
+            // Inject ALL user-configured service credentials (ANTHROPIC_API_KEY,
+            // OPENAI_API_KEY, etc.) from the credential store. Falls back to
+            // process.env for ANTHROPIC_API_KEY if not in the store.
             try {
                 Object.assign(childEnv, credentialStore.getDecryptedEnvVars());
             } catch {
                 // Non-fatal — credentials may not be configured
+            }
+            if (childEnv['ANTHROPIC_API_KEY'] === undefined && process.env['ANTHROPIC_API_KEY']) {
+                childEnv['ANTHROPIC_API_KEY'] = process.env['ANTHROPIC_API_KEY'];
             }
 
             proc = spawn(CLAUDE_BIN, claudeArgs, {
@@ -495,14 +497,14 @@ export class ConductorWrapper {
             for (const key of KEEP) {
                 if (process.env[key] !== undefined) childEnv[key] = process.env[key]!;
             }
-            if (process.env['ANTHROPIC_API_KEY']) {
-                childEnv['ANTHROPIC_API_KEY'] = process.env['ANTHROPIC_API_KEY'];
-            }
             childEnv['DISABLE_AUTOUPDATER'] = '1';
             childEnv['CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL'] = '1';
             try {
                 Object.assign(childEnv, credentialStore.getDecryptedEnvVars());
             } catch { /* Non-fatal */ }
+            if (childEnv['ANTHROPIC_API_KEY'] === undefined && process.env['ANTHROPIC_API_KEY']) {
+                childEnv['ANTHROPIC_API_KEY'] = process.env['ANTHROPIC_API_KEY'];
+            }
 
             proc = spawn(CLAUDE_BIN, claudeArgs, {
                 stdio: ['ignore', 'pipe', 'pipe'],

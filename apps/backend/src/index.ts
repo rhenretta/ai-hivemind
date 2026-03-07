@@ -9,12 +9,20 @@
 
 import { httpServer, io } from './server.js';
 import { authManager } from './services/authManager.js';
+import { credentialStore } from './services/credentialStore.js';
 import { logger } from './services/logger.js';
 import { buildSandboxImage, cleanupStaleSandboxes } from './services/sandboxManager.js';
 import { loadPendingState, clearState } from './services/taskStateStore.js';
 import { QaEngineer } from './agents/qaEngineer.js';
 
 import type { SweArtifact } from '@ai-hivemind/shared';
+
+// ─── Hydrate process.env from credential store ──────────────────────────────
+// Keys stored via the Settings page (e.g. OPENAI_API_KEY, ANTHROPIC_API_KEY)
+// are injected into process.env so services like llm.ts can read them without
+// needing direct credential store access. Env vars from .env.local take
+// precedence — hydrateProcessEnv only fills in missing vars.
+credentialStore.hydrateProcessEnv();
 
 const PORT = parseInt(process.env['PORT'] ?? '3001', 10);
 
