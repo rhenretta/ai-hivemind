@@ -21,7 +21,7 @@ import type { SystemEvent } from '@ai-hivemind/shared';
 import { eventBus } from '../eventBus.js';
 import { authManager } from './authManager.js';
 import { credentialStore } from './credentialStore.js';
-import { execInSandbox, type SandboxHandle } from './sandboxManager.js';
+import { execInSandbox, injectClaudeCredentials, type SandboxHandle } from './sandboxManager.js';
 
 // ── Monorepo root ─────────────────────────────────────────────────────────────
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -218,8 +218,17 @@ export class ConductorWrapper {
      * gates the `--remote` flag and Remote Control subcommands).
      */
     #spawnClaude(prompt: string, sandbox?: SandboxHandle): void {
-        // Ensure OAuth token is fresh before spawning (no-op if using API key)
-        authManager.ensureFreshToken();
+        // Ensure OAuth token is fresh before spawning (no-op if using API key).
+        // Returns false if auth is broken and the user needs to re-login.
+        const authOk = authManager.ensureFreshToken();
+        if (!authOk) {
+            this.emit('ERROR', {
+                message: 'OAuth token expired and could not be refreshed. Please run "claude auth login" in a terminal to re-authenticate.',
+                phase: 'auth',
+            });
+            // Still attempt to spawn — the Keychain might have been refreshed by another
+            // process between our check and the spawn. The 401 detection below will catch it.
+        }
 
         const self = this;
         const claudeArgs = [
@@ -236,6 +245,12 @@ export class ConductorWrapper {
             // ── Docker sandbox mode ──────────────────────────────────────────
             // Run Claude Code inside the isolated container. Environment and
             // working directory are already configured in the container image.
+            //
+            // Re-inject OAuth credentials from Keychain into the container.
+            // ensureFreshToken() above may have refreshed the host Keychain,
+            // but the container still has the token from when it was created.
+            // On long-running tasks with retries, the original token expires.
+            injectClaudeCredentials(sandbox.containerName);
             console.log(`[Conductor:${self.agentId}] Spawning Claude Code in container=${sandbox.containerName} prompt="${prompt.slice(0, 60)}"`);
             proc = execInSandbox(sandbox, CLAUDE_BIN, claudeArgs);
         } else {
@@ -293,6 +308,15 @@ export class ConductorWrapper {
             const text = chunk.toString('utf8');
             if (text.trim().length > 0) {
                 console.warn(`[Conductor:${self.agentId}] stderr: ${text.trim().slice(0, 200)}`);
+
+                // Detect authentication failures and surface them clearly
+                if (text.includes('authentication_error') || text.includes('Failed to authenticate') || text.includes('API Error: 401')) {
+                    self.emit('ERROR', {
+                        message: 'Claude Code authentication failed (401). Run "claude auth login" in a terminal to refresh your OAuth token.',
+                        phase: 'auth',
+                    });
+                }
+
                 // Emit server log lines to the activity feed
                 for (const line of text.split('\n')) {
                     if (line.trim().length > 0) {
@@ -470,7 +494,13 @@ export class ConductorWrapper {
      * Spawn Claude Code with --resume to continue an existing session.
      */
     #spawnClaudeResume(sessionId: string, prompt: string, sandbox?: SandboxHandle): void {
-        authManager.ensureFreshToken();
+        const authOk = authManager.ensureFreshToken();
+        if (!authOk) {
+            this.emit('ERROR', {
+                message: 'OAuth token expired and could not be refreshed. Please run "claude auth login" in a terminal to re-authenticate.',
+                phase: 'auth',
+            });
+        }
 
         const self = this;
         const claudeArgs = [
@@ -485,6 +515,8 @@ export class ConductorWrapper {
         let proc: ChildProcess;
 
         if (sandbox !== undefined) {
+            // Re-inject OAuth credentials (token may have been refreshed since container creation)
+            injectClaudeCredentials(sandbox.containerName);
             console.log(`[Conductor:${self.agentId}] Resuming session=${sessionId} in container=${sandbox.containerName}`);
             proc = execInSandbox(sandbox, CLAUDE_BIN, claudeArgs);
         } else {
@@ -532,6 +564,15 @@ export class ConductorWrapper {
             const text = chunk.toString('utf8');
             if (text.trim().length > 0) {
                 console.warn(`[Conductor:${self.agentId}] stderr: ${text.trim().slice(0, 200)}`);
+
+                // Detect authentication failures and surface them clearly
+                if (text.includes('authentication_error') || text.includes('Failed to authenticate') || text.includes('API Error: 401')) {
+                    self.emit('ERROR', {
+                        message: 'Claude Code authentication failed (401). Run "claude auth login" in a terminal to refresh your OAuth token.',
+                        phase: 'auth',
+                    });
+                }
+
                 // Emit server log lines to the activity feed
                 for (const line of text.split('\n')) {
                     if (line.trim().length > 0) {

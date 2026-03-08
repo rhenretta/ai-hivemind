@@ -30,8 +30,9 @@ const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 /** Refresh when token expires within this many milliseconds */
 const REFRESH_BUFFER_MS = 10 * 60 * 1000; // 10 minutes
 
-/** Background check interval */
-const CHECK_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+/** Background check interval — keep this short to stay in sync with the
+ *  interactive Claude Code session which may refresh tokens independently. */
+const CHECK_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
 // ── State ────────────────────────────────────────────────────────────────────
 
@@ -297,29 +298,58 @@ function init(): void {
     logger.info(`[AuthManager] Background refresh scheduled every ${CHECK_INTERVAL_MS / 60000}m`);
 }
 
-function ensureFreshToken(): void {
-    if (!enabled) return;
+/**
+ * Ensure the OAuth token is fresh before spawning Claude Code.
+ * Returns true if auth is OK, false if auth is broken and the user needs to re-login.
+ *
+ * ALWAYS re-reads the Keychain (not just when our cache says the token is expired).
+ * This is critical because the interactive Claude Code session on the host refreshes
+ * tokens independently. When it refreshes, it consumes the old refresh token and
+ * writes new access + refresh tokens to the Keychain. If we only re-read the Keychain
+ * when our cached token expires, we'd miss the new refresh token and try to use the
+ * old (consumed) one — resulting in `invalid_grant` errors.
+ *
+ * A Keychain read is fast (~50ms) and this is only called before each Claude spawn.
+ */
+function ensureFreshToken(): boolean {
+    if (!enabled) return true; // API key mode — always OK
 
-    const remaining = cachedExpiresAt - Date.now();
-    if (remaining > REFRESH_BUFFER_MS) return; // fast path
-
-    // Re-read Keychain in case another process (e.g. interactive Claude Code)
-    // has already refreshed the token.
+    // Always re-read Keychain to pick up tokens refreshed by other processes
+    // (e.g. the interactive Claude Code session running on the host).
     const credential = readKeychainCredential();
     if (credential !== null) {
         const keychainExpiry = credential.claudeAiOauth.expiresAt;
-        if (keychainExpiry > cachedExpiresAt) {
-            // Another process refreshed — update our cache
+        if (keychainExpiry !== cachedExpiresAt) {
             cachedExpiresAt = keychainExpiry;
-            const newRemaining = cachedExpiresAt - Date.now();
-            if (newRemaining > REFRESH_BUFFER_MS) {
-                logger.info('[AuthManager] Token refreshed by another process, using updated credential');
-                return;
-            }
+            logger.debug(`[AuthManager] Synced token from Keychain, expires in ${Math.round((keychainExpiry - Date.now()) / 60000)}m`);
+        }
+
+        const remaining = keychainExpiry - Date.now();
+        if (remaining > REFRESH_BUFFER_MS) {
+            return true; // Token is fresh
         }
     }
 
-    checkAndRefresh();
+    // Token is expired or about to expire — attempt refresh
+    const refreshed = doRefresh();
+    if (!refreshed) {
+        // Refresh failed — re-read Keychain one more time in case another process
+        // refreshed between our read and the failed attempt (race condition).
+        const retryCredential = readKeychainCredential();
+        if (retryCredential !== null) {
+            const retryExpiry = retryCredential.claudeAiOauth.expiresAt;
+            const retryRemaining = retryExpiry - Date.now();
+            if (retryRemaining > REFRESH_BUFFER_MS) {
+                cachedExpiresAt = retryExpiry;
+                logger.info('[AuthManager] Token refreshed by another process during our refresh attempt');
+                return true;
+            }
+        }
+
+        logger.error('[AuthManager] OAuth token is expired and could not be refreshed. Run "claude auth login" to re-authenticate.');
+        return false;
+    }
+    return true;
 }
 
 function shutdown(): void {

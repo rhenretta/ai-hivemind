@@ -558,7 +558,7 @@ function injectSourceCode(containerName: string): void {
  *
  * Safe to call on any platform — silently skips on Linux/Windows.
  */
-function injectClaudeCredentials(containerName: string): void {
+export function injectClaudeCredentials(containerName: string): void {
     if (process.platform !== 'darwin') return;
 
     try {
