@@ -11,11 +11,12 @@ import { z } from 'zod';
 // ─── Test type: what kind of check this test performs ────────────────────────
 
 export const QaTestTypeSchema = z.enum([
-    'api',      // HTTP endpoint probing (health, status, response body)
-    'visual',   // Screenshot + vision analysis
-    'build',    // Compile / lint / test suite checks
-    'content',  // Response body validation (schema, data, structure)
-    'custom',   // Agent-defined test type
+    'api',          // HTTP endpoint probing (health, status, response body)
+    'visual',       // Screenshot + vision analysis
+    'build',        // Compile / lint / test suite checks
+    'content',      // Response body validation (schema, data, structure)
+    'interaction',  // Browser interaction tests (click, fill, navigate, form submit)
+    'custom',       // Agent-defined test type
 ]);
 export type QaTestType = z.infer<typeof QaTestTypeSchema>;
 

@@ -7,7 +7,9 @@
  *  3. Revises the plan when discoveries warrant new tests
  *  4. Submits a comprehensive verdict (via submit_qa_verdict tool)
  *
- * Tool whitelist: execute_cli_command, http_get, screenshot_url,
+ * Tool whitelist: execute_cli_command, http_get, browser_navigate,
+ *                 browser_screenshot, browser_click, browser_fill,
+ *                 browser_wait_for, browser_get_text, browser_evaluate,
  *                 update_test_plan, submit_qa_verdict
  *
  * Tier 2 constraints:
@@ -23,6 +25,7 @@ import { v4 as uuidv4 } from 'uuid';
 
 import { generateWithRawTools, extractTextContent } from '../services/llm.js';
 import { executeTool } from '../services/mcpExecutor.js';
+import { QaBrowserSession } from '../services/qaBrowser.js';
 import { logger } from '../services/logger.js';
 import { eventBus } from '../eventBus.js';
 import type { SandboxHandle } from '../services/sandboxManager.js';
@@ -41,7 +44,9 @@ const MONOREPO_ROOT = process.env['MONOREPO_ROOT'] ?? '/Users/rhenretta/workspac
 // ── Tool whitelist ────────────────────────────────────────────────────────────
 
 const QA_TOOL_NAMES = new Set([
-    'execute_cli_command', 'http_get', 'screenshot_url',
+    'execute_cli_command', 'http_get',
+    'browser_navigate', 'browser_screenshot', 'browser_click',
+    'browser_fill', 'browser_wait_for', 'browser_get_text', 'browser_evaluate',
     'update_test_plan', 'submit_qa_verdict',
 ]);
 
@@ -167,16 +172,101 @@ const QA_OPENAI_TOOLS: OpenAI.ChatCompletionTool[] = [
     {
         type: 'function',
         function: {
-            name: 'screenshot_url',
-            description: 'Take a full-page Playwright screenshot of a URL. Waits for page load PLUS an extra delay for async JS/React rendering. Returns base64 PNG on success, or [PLAYWRIGHT_UNAVAILABLE] if Playwright is not installed.',
+            name: 'browser_navigate',
+            description: 'Navigate the browser to a URL. By default waits for network idle (no pending requests for 500ms) — dynamically detects when async data fetches complete. No need to guess wait times.',
             parameters: {
                 type: 'object',
                 properties: {
-                    url: { type: 'string', description: 'URL to screenshot' },
-                    timeout_ms: { type: 'number', description: 'Page load timeout in ms', default: 15000 },
-                    wait_after_load_ms: { type: 'number', description: 'Extra delay (ms) after page load before capturing — lets async data fetches complete. Default 3000.', default: 3000 },
+                    url: { type: 'string', description: 'URL to navigate to' },
+                    wait_until: { type: 'string', enum: ['networkidle', 'load', 'domcontentloaded'], description: 'When to consider navigation done. Default: networkidle (waits for all fetch() calls to finish).', default: 'networkidle' },
                 },
                 required: ['url'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'browser_screenshot',
+            description: 'Take a screenshot of the current page. Call this AFTER navigating and verifying content is loaded. Returns base64 PNG for visual analysis.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    full_page: { type: 'boolean', description: 'Capture full scrollable page (true) or just the viewport (false). Default: true.', default: true },
+                },
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'browser_click',
+            description: 'Click an element by CSS selector. Use for buttons, links, tabs, toggles.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    selector: { type: 'string', description: 'CSS selector for the element to click (e.g., "button.submit", "#login-btn", "a[href=\'/about\']")' },
+                    timeout_ms: { type: 'number', description: 'Max time to wait for element to be clickable (ms). Choose based on context: 10000 for static elements, 30000 for dynamically loaded content.' },
+                },
+                required: ['selector'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'browser_fill',
+            description: 'Fill a form input with text. Works with <input>, <textarea>, and [contenteditable] elements.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    selector: { type: 'string', description: 'CSS selector for the input element' },
+                    value: { type: 'string', description: 'Text to type into the field' },
+                },
+                required: ['selector', 'value'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'browser_wait_for',
+            description: 'Wait for a DOM element to reach a specific state. Use to wait for loading spinners to disappear, content to appear, or modals to show/hide. You MUST specify timeout_ms — think about the data flow: static content (10s), local DB (15-20s), external API like Reddit/Twitter (45-60s), AI/LLM chain (60s).',
+            parameters: {
+                type: 'object',
+                properties: {
+                    selector: { type: 'string', description: 'CSS selector to wait for' },
+                    state: { type: 'string', enum: ['visible', 'hidden', 'attached', 'detached'], description: 'Desired state. "visible" = element exists and is visible. "hidden" = element is gone or invisible. Default: visible.', default: 'visible' },
+                    timeout_ms: { type: 'number', description: 'REQUIRED. Max wait time in ms. Choose based on data source: 10000 for static/pre-rendered content, 15000-20000 for local DB queries, 30000 for simple API calls, 45000-60000 for external APIs (Reddit, Twitter, etc.), 60000 for AI/LLM processing chains.' },
+                },
+                required: ['selector', 'timeout_ms'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'browser_get_text',
+            description: 'Read text content from an element or the entire page. Useful for verifying rendered content without taking a screenshot.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    selector: { type: 'string', description: 'CSS selector to read text from. If omitted, returns full page body text.' },
+                },
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'browser_evaluate',
+            description: 'Execute JavaScript in the page context. Returns the JSON-stringified result. Use for advanced checks like counting elements, reading computed styles, or checking React state.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    expression: { type: 'string', description: 'JavaScript expression to evaluate (e.g., "document.querySelectorAll(\'.post-card\').length")' },
+                },
+                required: ['expression'],
             },
         },
     },
@@ -197,7 +287,7 @@ const QA_OPENAI_TOOLS: OpenAI.ChatCompletionTool[] = [
                                 id: { type: 'string', description: 'Unique test ID, e.g. "api-health", "visual-homepage"' },
                                 name: { type: 'string', description: 'Human-readable test name' },
                                 description: { type: 'string', description: 'What this test verifies' },
-                                type: { type: 'string', enum: ['api', 'visual', 'build', 'content', 'custom'], description: 'Test category' },
+                                type: { type: 'string', enum: ['api', 'visual', 'build', 'content', 'interaction', 'custom'], description: 'Test category' },
                                 status: { type: 'string', enum: ['pending', 'running', 'passed', 'failed', 'skipped'], description: 'Current status' },
                                 result: { type: 'string', description: 'Explanation of pass/fail/skip (required for non-pending tests)' },
                             },
@@ -283,6 +373,7 @@ function buildQaSystemPrompt(
     serversStarted: string[] = [],
     designSpec?: UxDesignSpec,
     taskGraph?: TaskGraph,
+    priorIssues?: string[],
 ): string {
     const artifactSummary = [
         `Claude Code exit: ${artifact.success ? 'SUCCESS' : 'FAILED'}`,
@@ -336,56 +427,144 @@ ${designSpec.uxAcceptanceCriteria}`
     // Build task graph context so QA knows what's done, active, and planned
     const taskGraphSection = buildTaskGraphSection(taskGraph, subtask);
 
+    // Build prior issues section for retry runs
+    const isRetry = priorIssues !== undefined && priorIssues.length > 0;
+    const priorIssuesSection = isRetry
+        ? `
+PRIOR QA ISSUES (from previous run — the SWE attempted to fix these):
+${priorIssues.map((issue) => `  - ${issue}`).join('\n')}
+
+YOUR PRIORITY: Re-test each prior issue above to verify the fix. Your test plan MUST include
+a specific test for EACH prior issue. If the fix works, mark it passed. If not, report the
+SAME issue again (not a different variation). Do NOT invent new test categories that weren't
+in the previous run — the SWE can only fix what was reported.
+`
+        : '';
+
     // Common three-phase instructions (used in both sandbox and live modes)
     const testingProcess = `
 ## Your Testing Process
 
-You have 5 tools available:
+You have a **persistent browser session** and these tools:
+
+### Test Management
 - **update_test_plan** — Create or update your structured testing plan (call this FIRST, then after each test)
 - **submit_qa_verdict** — Submit your final verdict when all tests are complete (call this LAST)
-- **execute_cli_command** — Run shell commands (curl, jq, etc.)
+
+### API Testing
 - **http_get** — Probe HTTP endpoints and inspect responses. Supports \`timeout_ms\` parameter (default: 10s).
-- **screenshot_url** — Take Playwright screenshots (waits 3s after page load by default for async data)
+- **execute_cli_command** — Run shell commands (curl, jq, etc.)
 
-### Timeout Guidelines
-Think about the FULL call chain before choosing timeouts. Read the SUBTASK and SWE ARTIFACT to understand
-what happens when a request is made, then set timeouts accordingly.
+### Browser Testing (persistent session — state carries across calls)
+- **browser_navigate** — Navigate to a URL. Waits for \`networkidle\` by default (all fetch() calls complete — no guessing wait times!)
+- **browser_screenshot** — Capture the current page as a screenshot for visual analysis
+- **browser_click** — Click an element by CSS selector (buttons, links, tabs, toggles)
+- **browser_fill** — Fill a form input by CSS selector
+- **browser_wait_for** — Wait for an element to appear, disappear, or change visibility
+- **browser_get_text** — Read text content from the page or a specific element
+- **browser_evaluate** — Execute JavaScript in the page context (count elements, check styles, etc.)
 
-**http_get \`timeout_ms\`** (default 10s):
-| Endpoint type | timeout_ms | Why |
+### Timeout Strategy — THINK BEFORE YOU WAIT
+You MUST choose timeout_ms values intelligently for every call. There are NO good defaults —
+the right timeout depends entirely on the data flow behind what you're testing.
+
+**Before choosing a timeout, ask yourself:** What has to happen before this element/response appears?
+Trace the FULL data flow: browser → frontend → backend → data source → back through each layer.
+
+**http_get timeout_ms:**
+| Data flow | timeout_ms | Reasoning |
 |---|---|---|
-| Health checks, static routes | 10000 | No processing |
-| Database queries, simple CRUD | 15000 | DB round-trip |
-| External API calls (Reddit, Twitter) | 30000-45000 | Network to third-party |
-| AI/LLM processing (OpenAI, sentiment) | 45000-60000 | LLM inference is slow |
-| Chained: fetch → AI filter → transform | 60000 | Multiple slow operations |
+| Health check, static routes | 10000 | No processing needed |
+| Local DB read/write | 15000 | Single DB round-trip |
+| External API (Reddit, Twitter, etc.) | 30000-45000 | Network hop to third-party + their processing |
+| AI/LLM call (OpenAI, sentiment analysis) | 45000-60000 | LLM inference is inherently slow |
+| Chained: external API → AI filter → transform | 60000 | Multiple slow hops compound |
 
-**screenshot_url \`wait_after_load_ms\`** (default 3s) — same logic, but for the ENTIRE page render chain:
-The page loads instantly (HTML), then makes fetch() calls. \`wait_after_load_ms\` must cover the fetch + render.
-| Page fetches from... | wait_after_load_ms | Why |
+**browser_wait_for timeout_ms (REQUIRED — you must always specify this):**
+| What's happening behind the element | timeout_ms | Reasoning |
 |---|---|---|
-| Static data / local state | 3000 | Default is fine |
-| Simple backend DB query | 10000 | DB + render |
-| External API (Reddit, etc.) | 30000 | API round-trip + render |
-| AI-powered endpoint (OpenAI filter) | 45000-60000 | LLM + render |
+| Static/pre-rendered content, simple DOM | 10000 | Already available, just mounting |
+| Content from local database | 15000-20000 | DB query + render |
+| Content from your own backend API | 20000-30000 | Backend processing + render |
+| Content from external APIs (Reddit, Twitter) | 45000-60000 | Browser → backend → external API → parse → render |
+| Content requiring AI/LLM processing | 60000 | Slowest possible path |
 
-A timeout is NOT a failure of the code — it may mean you didn't wait long enough. Always try a generous
-timeout FIRST, especially for pages that depend on slow backends.
+**Example reasoning for a Reddit doomscroll page:**
+  The page fetches Reddit posts: browser → Next.js → backend → Reddit API → filter → return → render.
+  Reddit's API can take 5-15s alone, plus backend processing and frontend rendering.
+  Correct timeout: 60000ms for browser_wait_for('.post-card', { timeout_ms: 60000 })
+  WRONG: Using 10000ms and then reporting "timed out" as a bug — that's YOUR timeout being too short!
+
+### Browser Testing Workflow
+NOTE: A screenshot is automatically captured after every browser action (navigate, click, fill,
+wait_for) — you do NOT need to call browser_screenshot manually unless you want an extra capture
+at a specific moment. The auto-screenshots are emitted to the Command Center for visual debugging.
+
+**CRITICAL — DISCOVER SELECTORS, NEVER GUESS THEM:**
+You do NOT know what CSS classes the SWE used. Never invent selectors like \`.post-card\`, \`.arrow-nav\`,
+\`.results-list\` — those are GUESSES and will fail if the SWE used different class names.
+
+**ALWAYS discover the actual DOM structure FIRST** by using browser_evaluate after navigation:
+\`\`\`
+browser_evaluate({ expression: "document.querySelector('main')?.innerHTML.slice(0, 1000) || document.body.innerHTML.slice(0, 1000)" })
+\`\`\`
+This reveals the REAL class names, element structure, and content. Then use those actual selectors.
+
+For frontend/visual tests, use this pattern:
+1. **browser_navigate**(url) — waits for all network activity to settle (auto-screenshot taken)
+2. **browser_evaluate** — inspect the DOM to discover actual selectors: what classes, IDs, data attributes exist?
+3. **browser_wait_for**(REAL_selector, { timeout_ms: ??? }) — use the selectors you DISCOVERED, not guessed
+4. **browser_get_text**(selector) — verify text content matches expectations
+5. **browser_screenshot** — take a screenshot to SEE the page (auto-screenshots go to Command Center, not to you)
+
+For interactive/form tests:
+1. **browser_navigate**(url) — go to the page (auto-screenshot taken)
+2. **browser_evaluate** — discover form selectors (input names, button text, form structure)
+3. **browser_fill**(REAL_selector, 'test query') — use discovered selector (auto-screenshot taken)
+4. **browser_click**(REAL_selector) — use discovered selector (auto-screenshot taken)
+5. **browser_wait_for**(REAL_selector, { state: 'visible', timeout_ms: ??? }) — use discovered selector
+
+If a page shows a loading spinner after navigation:
+1. **browser_wait_for**('.loading-spinner, [class*="loading"], [class*="spinner"]', { state: 'hidden', timeout_ms: ??? }) — use broad selector
+2. **browser_evaluate** — discover what content selectors actually exist now that loading is done
+3. **browser_wait_for**(REAL_selector, { state: 'visible', timeout_ms: ??? }) — use discovered selector
+
+**TIMEOUT + SELECTOR RECOVERY RULE:** If browser_wait_for times out, the element may exist under a
+DIFFERENT selector. Before reporting failure:
+1. Take a **browser_screenshot** to SEE the page
+2. Run **browser_evaluate** to inspect what's actually in the DOM
+3. If content IS present under a different selector, retry with the correct one
+4. Only report "element not found" if you have CONFIRMED via screenshot + DOM inspection that the content truly doesn't exist
+The browser handles network-level waiting automatically. Use browser_wait_for for DOM-level state changes.
+Auto-screenshots at each step let you (and the user) see exactly what the page looks like.
+
+CRITICAL: If browser_wait_for times out, there are TWO possible causes:
+1. Your timeout was too short for the data flow → increase timeout and retry
+2. You GUESSED the wrong selector → the element exists under a different class name
+Before reporting ANY browser_wait_for failure:
+  a) Take a browser_screenshot to SEE the page
+  b) Run browser_evaluate to inspect the actual DOM structure
+  c) If content IS there under a different selector, use that selector instead
+  d) Only report failure if the content is CONFIRMED missing via screenshot + DOM inspection
+A page that fetches from Reddit with a 10s timeout WILL time out — that's not a bug, it's a bad timeout.
+A page showing real content that you can't find because you guessed \`.post-card\` instead of the
+actual class name — that's YOUR selector being wrong, not a code bug.
 
 ### Phase 1: Plan Your Tests
 Analyze the SWE artifact, acceptance criteria, ${hasDesign ? 'design spec, ' : ''}and available endpoints.
 Call **update_test_plan** with a comprehensive set of tests. Aim for 5-8 targeted tests covering:
-${hasBackendFiles ? '- API endpoint probes (health check, each relevant endpoint)' : ''}
-${hasBackendFiles ? '- Response content validation (correct data structure, non-empty results)' : ''}
-${hasFrontendFiles ? '- Visual validation (screenshot the page, check rendering and styling)' : ''}
+${hasBackendFiles ? '- API endpoint probes (health check, each relevant endpoint) — use http_get' : ''}
+${hasBackendFiles ? '- Response content validation (correct data structure, non-empty results) — use http_get' : ''}
+${hasFrontendFiles ? '- Visual validation (navigate, wait for content, screenshot) — use browser tools' : ''}
 ${hasFrontendFiles && hasDesign ? '- Design spec compliance (layout matches wireframe, key components present)' : ''}
-${hasFrontendFiles ? '- Loading state check (page must show REAL DATA, not spinners)' : ''}
+${hasFrontendFiles ? '- Loading state check (page must show REAL DATA, not spinners) — use browser_wait_for + browser_get_text' : ''}
+${hasFrontendFiles ? '- Interactive features (forms, buttons, navigation) — use browser_click, browser_fill' : ''}
 - Any other checks relevant to the acceptance criteria
 
 ### Phase 2: Execute & Revise Tests
 For each test in your plan:
 1. Call **update_test_plan** to mark the test as \`running\`
-2. Execute the test using http_get, screenshot_url, or execute_cli_command
+2. Execute the test using the appropriate tools (http_get for APIs, browser_* for frontend)
 3. Call **update_test_plan** to mark the test as \`passed\` or \`failed\` with a detailed result
 4. If you discover something unexpected, ADD new tests to the plan
 
@@ -401,24 +580,34 @@ After ALL tests are complete (no pending or running tests), call **submit_qa_ver
 - \`summary\`: comprehensive report of everything you tested and found
 
 IMPORTANT RULES:
-- **SCOPE RULE (CRITICAL):** ONLY test what THIS TASK requires. If no frontend files were changed, do NOT screenshot
-  the frontend or test frontend rendering — it may not exist yet. If no backend files were changed, do NOT probe
+- **ACCEPTANCE CRITERIA RULE (CRITICAL):** Your tests MUST be derived from the ACCEPTANCE CRITERIA above.
+  Every test in your plan must trace back to a specific acceptance criterion or a directly implied requirement.
+  Do NOT invent requirements that aren't stated or clearly implied. For example, if the acceptance criteria
+  says "GET /api/posts returns a JSON array of posts", you should test:
+    ✅ GET /api/posts returns 200 with a JSON array (stated)
+    ✅ Array items have expected fields (directly implied)
+    ✅ Health check works (infrastructure prerequisite)
+    ❌ POST to a GET endpoint returns a method-specific error (INVENTED — not in criteria)
+    ❌ Invalid query parameters return an error (INVENTED — not in criteria)
+    ❌ 404 returns JSON instead of HTML (INVENTED — not in criteria)
+  If the acceptance criteria doesn't mention error handling, DON'T test error handling.
+  If it doesn't mention input validation, DON'T test input validation.
+  Inventing requirements that the SWE was never told to implement is a CRITICAL QA ERROR.
+- **SCOPE RULE:** ONLY test what THIS TASK requires. If no frontend files were changed, do NOT use
+  browser tools to test frontend rendering — it may not exist yet. If no backend files were changed, do NOT probe
   backend endpoints. Failing a task because an unrelated service hasn't been built yet is a critical QA error.
   The "files changed" list tells you exactly what was implemented. Stick to that scope.
+- **STABILITY RULE:** On retries, your test plan must be STABLE — test the same things the previous QA tested,
+  plus verify that specific prior issues have been fixed. NEVER introduce NEW test categories on a retry that
+  weren't tested in the first run. The SWE can only fix what you reported; inventing new failures on each
+  retry creates an impossible moving target.
 - Any test with \`failed\` status means the overall verdict should be \`passed: false\`
-- A page stuck on "Loading..." after the screenshot wait is an AUTOMATIC FAIL
+- A page stuck on "Loading..." after browser_navigate + browser_wait_for is an AUTOMATIC FAIL
 - Unstyled HTML (raw browser defaults, no CSS) is an AUTOMATIC FAIL
 - Do NOT re-run pnpm build — the SWE already verified compilation. Focus on runtime behavior.
-
-NOTE ON SCREENSHOTS: screenshot_url waits \`wait_after_load_ms\` (default 3s) AFTER the page loads for async
-data to render. Apply the SAME timeout reasoning as http_get — if the page fetches from a slow backend:
-  - Page fetching from a simple DB query: wait_after_load_ms: 10000
-  - Page fetching from external APIs (Reddit, etc.): wait_after_load_ms: 30000
-  - Page fetching from AI-powered endpoints (OpenAI filtering, etc.): wait_after_load_ms: 45000-60000
-  Think about what happens when the page loads: it makes a fetch() call to the backend, which may call
-  external services. The screenshot wait must cover the ENTIRE chain.
-If the screenshot shows a loading spinner, FIRST check if you used a long enough wait. Retry with a
-longer wait_after_load_ms BEFORE marking the test as failed. Only fail after trying a generous wait.
+- **TIMEOUT RETRY RULE:** If browser_wait_for times out, consider whether you used a long enough timeout
+  for the data flow. If the page fetches from an external API and you used < 45000ms, RETRY with a longer
+  timeout before reporting failure. A short timeout is YOUR mistake, not a code bug.
 
 BAD TEST PLAN (never do this):
   [{ id: "check-all", name: "Check everything", description: "Test the whole feature", ... }]
@@ -429,20 +618,21 @@ ${hasBackendFiles && hasFrontendFiles ? `  Backend + Frontend example:
     { id: "backend-health", name: "Backend health check", type: "api", description: "GET /health returns 200" },
     { id: "api-posts", name: "GET /api/posts returns data", type: "api", description: "Endpoint returns non-empty array of posts" },
     { id: "api-posts-schema", name: "Posts response schema", type: "content", description: "Each post has title, author, score fields" },
-    { id: "frontend-render", name: "Homepage renders", type: "visual", description: "Screenshot shows rendered page, not loading spinner" },
-    { id: "frontend-styling", name: "Proper CSS styling", type: "visual", description: "Page has Tailwind classes, proper spacing, colors" },
+    { id: "frontend-render", name: "Page renders content", type: "visual", description: "Navigate, discover DOM structure via browser_evaluate, verify real content is present" },
+    { id: "frontend-styling", name: "Proper CSS styling", type: "visual", description: "browser_evaluate checks Tailwind classes exist on main container" },
+    { id: "frontend-interaction", name: "Interaction works", type: "interaction", description: "Discover interactive element selectors via browser_evaluate, click, verify state change" },
   ]` : hasBackendFiles ? `  Backend-only example (NO frontend tests — frontend was not changed):
   [
     { id: "backend-health", name: "Backend health check", type: "api", description: "GET /health returns 200" },
     { id: "api-posts", name: "GET /api/posts returns data", type: "api", description: "Endpoint returns non-empty array of posts" },
     { id: "api-posts-schema", name: "Posts response schema", type: "content", description: "Each post has title, author, score fields" },
-    { id: "api-error-handling", name: "Error response format", type: "api", description: "Invalid request returns proper error JSON" },
+    { id: "api-response-time", name: "Response completes", type: "api", description: "Endpoint responds within timeout (not hanging)" },
   ]` : `  Frontend-only example (NO backend tests — backend was not changed):
   [
-    { id: "frontend-render", name: "Homepage renders", type: "visual", description: "Screenshot shows rendered page, not loading spinner" },
-    { id: "frontend-styling", name: "Proper CSS styling", type: "visual", description: "Page has Tailwind classes, proper spacing, colors" },
-    { id: "frontend-content", name: "Page shows real data", type: "content", description: "Page displays actual content, not placeholder text" },
-    { id: "frontend-layout", name: "Layout matches design", type: "visual", description: "Components match wireframe layout and spacing" },
+    { id: "frontend-discover", name: "Discover page structure", type: "visual", description: "Navigate, use browser_evaluate to find actual CSS classes and element structure" },
+    { id: "frontend-render", name: "Page shows real data", type: "visual", description: "Using discovered selectors, verify content is present, take screenshot" },
+    { id: "frontend-styling", name: "Proper CSS styling", type: "visual", description: "browser_evaluate confirms Tailwind classes on container elements" },
+    { id: "frontend-interaction", name: "Interactive features work", type: "interaction", description: "Using discovered selectors, click/interact and verify response" },
   ]`}
 
 ISSUES FORMAT — each issue MUST be specific and actionable so the SWE can fix it:
@@ -453,7 +643,7 @@ BAD (too vague — NEVER write issues like these):
 GOOD (specific — ALWAYS write issues like these):
   - "GET http://localhost:54372/api/posts returned HTTP 200 but body is empty array [] — expected non-empty array with title, author, score fields"
   - "Screenshot of http://localhost:54372/doomscroll shows unstyled HTML — no Tailwind classes on main container, expected centered single-column layout"
-  - "PostCard component missing from /doomscroll — page shows raw JSON in <pre> tag instead of styled card components"
+  - "PostCard component missing from /doomscroll — browser_get_text('.main') returns raw JSON instead of styled card content"
 Each issue must include: the URL you probed, what you expected, and what you actually found.
 
 STEPS TO REPRODUCE — when the verdict fails, provide an ordered list the SWE can follow:
@@ -478,7 +668,7 @@ All CLI commands (execute_cli_command) run inside the container automatically.
 SUBTASK: ${subtask}
 
 ACCEPTANCE CRITERIA: ${acceptanceCriteria}
-${designSection}
+${priorIssuesSection}${designSection}
 ${taskGraphSection}
 SWE ARTIFACT:
 ${artifactSummary}
@@ -516,7 +706,7 @@ The SWE/Claude Code agent already ran tsc and build checks. Do NOT re-run those.
 SUBTASK: ${subtask}
 
 ACCEPTANCE CRITERIA: ${acceptanceCriteria}
-${designSection}
+${priorIssuesSection}${designSection}
 ${taskGraphSection}
 SWE ARTIFACT:
 ${artifactSummary}
@@ -567,6 +757,9 @@ export class QaEngineer extends BaseAgent {
     /** Active sandbox handle for Docker-based validation */
     #sandbox: SandboxHandle | undefined;
 
+    /** Persistent Playwright browser session for interactive testing */
+    #browserSession: QaBrowserSession | null = null;
+
     /** Structured test plan managed by the QA LLM */
     #testPlan: QaTestPlan | null = null;
 
@@ -588,6 +781,7 @@ export class QaEngineer extends BaseAgent {
         sandbox?: SandboxHandle,
         designSpec?: UxDesignSpec | null,
         taskGraph?: TaskGraph,
+        priorIssues?: string[],
     ): Promise<QaVerdict> {
         this.#sandbox = sandbox;
         this.#testPlan = null;
@@ -609,18 +803,32 @@ export class QaEngineer extends BaseAgent {
             serversStarted = await this.#startSandboxServers(artifact, sandbox);
         }
 
+        // Launch persistent Playwright browser session for interactive testing
+        const allowedPorts = sandbox !== undefined
+            ? Object.keys(sandbox.portMap).map(Number)
+            : undefined;
+        this.#browserSession = new QaBrowserSession(allowedPorts);
+        await this.#browserSession.launch();
+
         const systemPrompt = buildQaSystemPrompt(
             subtask, acceptanceCriteria, artifact, serviceUrl,
             sandbox, serversStarted,
             designSpec ?? undefined,
             taskGraph,
+            priorIssues,
         );
+
+        const isRetry = priorIssues !== undefined && priorIssues.length > 0;
 
         const messages: OpenAI.ChatCompletionMessageParam[] = [
             { role: 'system', content: systemPrompt },
             {
                 role: 'user',
-                content: 'Begin your QA validation. Start by creating your testing plan with update_test_plan, then execute each test.',
+                content: isRetry
+                    ? 'Begin your QA validation. This is a RETRY — the SWE has attempted to fix the prior issues listed above. '
+                      + 'Start by creating your testing plan with update_test_plan. Your plan MUST include a specific test for EACH '
+                      + 'prior issue to verify the fix. Then add tests for the acceptance criteria. Execute each test.'
+                    : 'Begin your QA validation. Start by creating your testing plan with update_test_plan, then execute each test.',
             },
         ];
 
@@ -662,8 +870,8 @@ export class QaEngineer extends BaseAgent {
                     };
                     const args = JSON.parse(fnCall.function.arguments) as Record<string, unknown>;
                     const result = await this.#dispatchTool(fnCall.function.name, args);
-                    const isScreenshot = fnCall.function.name === 'screenshot_url'
-                        && !result.startsWith('[PLAYWRIGHT_UNAVAILABLE]');
+                    const isScreenshot = fnCall.function.name === 'browser_screenshot'
+                        && !result.startsWith('[BROWSER_ERROR]');
 
                     if (isScreenshot) pendingScreenshotB64 = result;
 
@@ -686,12 +894,13 @@ export class QaEngineer extends BaseAgent {
                 if (pendingScreenshotB64 !== null) {
                     const b64 = pendingScreenshotB64;
                     pendingScreenshotB64 = null;
+                    const browserUrl = this.#browserSession?.getUrl() ?? serviceUrl ?? '';
                     messages.push({
                         role: 'user',
                         content: [
                             {
                                 type: 'text',
-                                text: 'Here is the screenshot of the deployed page. Analyze it visually — does it render correctly? Is it properly styled? Does it show real data (not loading spinners)? Update your test plan accordingly and continue with your remaining tests.',
+                                text: 'Here is the browser screenshot. Analyze it visually — does it render correctly? Is it properly styled? Does it show real data (not loading spinners or error pages)? Update your test plan accordingly and continue with your remaining tests.',
                             },
                             {
                                 type: 'image_url',
@@ -701,7 +910,7 @@ export class QaEngineer extends BaseAgent {
                     });
 
                     // Emit screenshot event so the Command Center can display it
-                    this.#emitScreenshot(b64, serviceUrl ?? '');
+                    this.#emitScreenshot(b64, browserUrl);
                 }
 
                 // Check if verdict was submitted via tool
@@ -758,6 +967,10 @@ export class QaEngineer extends BaseAgent {
             phase: 'validate',
             passed: verdict.passed,
         });
+
+        // Close the persistent browser session
+        await this.#browserSession?.close();
+        this.#browserSession = null;
 
         this.terminate('qa_complete');
         return verdict;
@@ -922,6 +1135,11 @@ export class QaEngineer extends BaseAgent {
             return this.#handleSubmitVerdict(args);
         }
 
+        // ── Browser tools — routed through persistent QaBrowserSession ────
+        if (name.startsWith('browser_')) {
+            return this.#dispatchBrowserTool(name, args);
+        }
+
         // ── Sandbox mode: route tools through Docker ──────────────────────
         if (this.#sandbox !== undefined) {
             if (name === 'execute_cli_command') {
@@ -935,7 +1153,7 @@ export class QaEngineer extends BaseAgent {
                 return result;
             }
 
-            if (name === 'http_get' || name === 'screenshot_url') {
+            if (name === 'http_get') {
                 // 1:1 port mapping — no URL rewriting needed.
                 // Block requests to ports not in our portMap to prevent probing host services.
                 const url = String(args['url'] ?? '');
@@ -956,17 +1174,16 @@ export class QaEngineer extends BaseAgent {
                 this.emit('TOOL_USED', { toolName: name, input: args, phase: 'qa' });
 
                 // Retry on connection refused — dev server may be momentarily restarting
-                const maxRetries = name === 'http_get' ? 3 : 1;
                 let lastResult = '';
-                for (let retry = 0; retry < maxRetries; retry++) {
+                for (let retry = 0; retry < 3; retry++) {
                     lastResult = await executeTool(name, args);
                     const isConnectionError = /ECONNREFUSED|ECONNRESET|ETIMEDOUT|connection refused|socket hang up/i.test(lastResult);
                     if (!isConnectionError) {
                         this.#emitToolResult(name, lastResult);
                         return lastResult;
                     }
-                    logger.warn(`[${this.agentId}] ${name} to ${url} failed (attempt ${(retry + 1).toString()}/${maxRetries.toString()}): connection error — retrying in 3s`);
-                    if (retry < maxRetries - 1) await sleep(3_000);
+                    logger.warn(`[${this.agentId}] ${name} to ${url} failed (attempt ${(retry + 1).toString()}/3): connection error — retrying in 3s`);
+                    if (retry < 2) await sleep(3_000);
                 }
                 this.#emitToolResult(name, lastResult);
                 return lastResult;
@@ -977,6 +1194,96 @@ export class QaEngineer extends BaseAgent {
         const result = await executeTool(name, args);
         this.#emitToolResult(name, result);
         return result;
+    }
+
+    // ── Browser tool dispatch ──────────────────────────────────────────────
+
+    async #dispatchBrowserTool(name: string, args: Record<string, unknown>): Promise<string> {
+        if (this.#browserSession === null) {
+            return '[BROWSER_ERROR] Browser session not available. This is a QA agent internal error.';
+        }
+
+        const self = this;
+
+        switch (name) {
+            case 'browser_navigate': {
+                const url = String(args['url'] ?? '');
+                const waitUntil = (args['wait_until'] as 'load' | 'networkidle' | 'domcontentloaded') ?? 'networkidle';
+                self.emit('TOOL_USED', { toolName: name, input: { url, waitUntil }, phase: 'qa' });
+                const result = await self.#browserSession!.navigate(url, waitUntil);
+                self.#emitToolResult(name, result);
+                await self.#autoScreenshot(`After navigating to ${url}`);
+                return result;
+            }
+            case 'browser_screenshot': {
+                const fullPage = args['full_page'] !== false;
+                self.emit('TOOL_USED', { toolName: name, input: { fullPage }, phase: 'qa' });
+                const result = await self.#browserSession!.screenshot(fullPage);
+                self.#emitToolResult(name, result);
+                return result;
+            }
+            case 'browser_click': {
+                const selector = String(args['selector'] ?? '');
+                const timeout = typeof args['timeout_ms'] === 'number' ? args['timeout_ms'] : undefined;
+                self.emit('TOOL_USED', { toolName: name, input: { selector }, phase: 'qa' });
+                const result = await self.#browserSession!.click(selector, timeout);
+                self.#emitToolResult(name, result);
+                await self.#autoScreenshot(`After clicking ${selector}`);
+                return result;
+            }
+            case 'browser_fill': {
+                const selector = String(args['selector'] ?? '');
+                const value = String(args['value'] ?? '');
+                self.emit('TOOL_USED', { toolName: name, input: { selector, value: value.slice(0, 100) }, phase: 'qa' });
+                const result = await self.#browserSession!.fill(selector, value);
+                self.#emitToolResult(name, result);
+                await self.#autoScreenshot(`After filling ${selector}`);
+                return result;
+            }
+            case 'browser_wait_for': {
+                const selector = String(args['selector'] ?? '');
+                const state = (args['state'] as 'visible' | 'hidden' | 'attached' | 'detached') ?? 'visible';
+                const timeout = typeof args['timeout_ms'] === 'number' ? args['timeout_ms'] : undefined;
+                self.emit('TOOL_USED', { toolName: name, input: { selector, state }, phase: 'qa' });
+                const result = await self.#browserSession!.waitFor(selector, state, timeout);
+                self.#emitToolResult(name, result);
+                await self.#autoScreenshot(`After waiting for ${selector} (${state})`);
+                return result;
+            }
+            case 'browser_get_text': {
+                const selector = typeof args['selector'] === 'string' ? args['selector'] : undefined;
+                self.emit('TOOL_USED', { toolName: name, input: { selector: selector ?? '(full page)' }, phase: 'qa' });
+                const result = await self.#browserSession!.getText(selector);
+                self.#emitToolResult(name, result);
+                return result;
+            }
+            case 'browser_evaluate': {
+                const expression = String(args['expression'] ?? '');
+                self.emit('TOOL_USED', { toolName: name, input: { expression: expression.slice(0, 120) }, phase: 'qa' });
+                const result = await self.#browserSession!.evaluate(expression);
+                self.#emitToolResult(name, result);
+                return result;
+            }
+            default:
+                return `[BROWSER_ERROR] Unknown browser tool: ${name}`;
+        }
+    }
+
+    /**
+     * Automatically capture and emit a screenshot after a browser interaction.
+     * These go to the Command Center only (not injected into the LLM conversation).
+     * Failures are non-fatal — we just log and continue.
+     */
+    async #autoScreenshot(description: string): Promise<void> {
+        if (this.#browserSession === null) return;
+        try {
+            const b64 = await this.#browserSession.screenshot(false); // viewport only, not full page
+            if (b64.startsWith('[BROWSER_ERROR]')) return;
+            const browserUrl = this.#browserSession.getUrl();
+            this.#emitScreenshot(b64, browserUrl, description);
+        } catch {
+            // Non-fatal — screenshot capture failure shouldn't break QA
+        }
     }
 
     // ── Test plan management ──────────────────────────────────────────────────
@@ -1057,7 +1364,8 @@ export class QaEngineer extends BaseAgent {
 
     /** Emit a TOOL_USED result event so the activity log shows tool output. */
     #emitToolResult(toolName: string, result: string): void {
-        const isScreenshot = toolName === 'screenshot_url' && result.length > 1000 && !result.startsWith('[');
+        const isScreenshot = (toolName === 'screenshot_url' || toolName === 'browser_screenshot')
+            && result.length > 1000 && !result.startsWith('[');
 
         // Determine error status from the result:
         // 1. Screenshots are always ok
@@ -1153,8 +1461,11 @@ export class QaEngineer extends BaseAgent {
         };
     }
 
-    #emitScreenshot(b64: string, url: string): void {
+    #emitScreenshot(b64: string, url: string, description?: string): void {
         // Emit as a custom payload on STATE_CHANGED — the Command Center can render this
+        const message = description !== undefined
+            ? `${description} — ${url}`
+            : `Visual screenshot captured for ${url}`;
         eventBus.emit({
             eventId: uuidv4(),
             timestamp: new Date().toISOString(),
@@ -1163,7 +1474,7 @@ export class QaEngineer extends BaseAgent {
             targetId: null,
             traceId: this.traceId,
             payload: {
-                message: `Visual screenshot captured for ${url}`,
+                message,
                 phase: 'validate',
                 screenshotB64: `data:image/png;base64,${b64}`,
                 screenshotUrl: url,
