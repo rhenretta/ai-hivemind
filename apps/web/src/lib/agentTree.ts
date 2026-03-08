@@ -35,6 +35,7 @@ export interface AgentNode {
 const ROLE_DISPLAY_NAMES: Record<string, string> = {
     'project-manager': 'Project Manager',
     'data-researcher': 'Data Researcher',
+    'site-explorer': 'Site Explorer',
     'ux-designer': 'UX Designer',
     'swe-agent': 'Software Engineer',
     'qa-engineer': 'QA Engineer',
@@ -48,6 +49,7 @@ const ROLE_DISPLAY_NAMES: Record<string, string> = {
  */
 const ROLE_PARENT_MAP: Record<string, string> = {
     'data-researcher': 'project-manager',
+    'site-explorer': 'project-manager',
     'ux-designer': 'project-manager',
     'swe-agent': 'project-manager',
     'qa-engineer': 'project-manager',

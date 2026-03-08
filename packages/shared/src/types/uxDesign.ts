@@ -30,5 +30,8 @@ export const UxDesignSpecSchema = z.object({
 
     /** Refined acceptance criteria that include UX requirements */
     uxAcceptanceCriteria: z.string(),
+
+    /** How users navigate to this feature from existing pages (optional for backward compat) */
+    navigationIntegration: z.string().optional(),
 });
 export type UxDesignSpec = z.infer<typeof UxDesignSpecSchema>;

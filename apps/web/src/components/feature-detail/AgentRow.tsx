@@ -7,6 +7,7 @@ import {
     ChevronDown,
     ChevronRight,
     Code,
+    Eye,
     Loader2,
     Palette,
     Search,
@@ -25,6 +26,7 @@ import { ActivityItem } from './ActivityItem';
 const ROLE_CONFIG: Record<string, { icon: typeof Bot; color: string; bg: string }> = {
     'project-manager': { icon: Bot, color: 'text-blue-400', bg: 'bg-blue-500/10' },
     'data-researcher': { icon: Search, color: 'text-purple-400', bg: 'bg-purple-500/10' },
+    'site-explorer': { icon: Eye, color: 'text-cyan-400', bg: 'bg-cyan-500/10' },
     'ux-designer': { icon: Palette, color: 'text-violet-400', bg: 'bg-violet-500/10' },
     'swe-agent': { icon: Code, color: 'text-green-400', bg: 'bg-green-500/10' },
     'qa-engineer': { icon: ShieldCheck, color: 'text-lime-400', bg: 'bg-lime-500/10' },

@@ -12,6 +12,9 @@
  * → TaskOrchestrator). Now it's a single agent that owns the full lifecycle.
  */
 
+import { execSync } from 'node:child_process';
+import { setTimeout as sleep } from 'node:timers/promises';
+
 import { v4 as uuidv4 } from 'uuid';
 
 import { generateWithRawTools, extractTextContent } from '../services/llm.js';
@@ -24,9 +27,12 @@ import { createFeatureSandbox, type SandboxHandle } from '../services/sandboxMan
 import { saveState, clearState } from '../services/taskStateStore.js';
 import { BaseAgent } from './baseAgent.js';
 import { DataResearcher } from './dataResearcher.js';
+import { SiteExplorer } from './siteExplorer.js';
 import { UxDesigner } from './uxDesigner.js';
 import { SoftwareEngineer } from './softwareEngineer.js';
 import { QaEngineer } from './qaEngineer.js';
+
+import type { SiteExplorationResult } from './siteExplorer.js';
 
 import type {
     TaskGraph,
@@ -67,7 +73,8 @@ A UX Designer has produced a design for this feature. When decomposing into task
 Design summary:
   Layout: ${designSpec!.layout.slice(0, 300)}
   Components: ${designSpec!.componentHierarchy.slice(0, 200)}
-  User Flow: ${designSpec!.userFlow.slice(0, 200)}`
+  User Flow: ${designSpec!.userFlow.slice(0, 200)}
+  Navigation: ${designSpec!.navigationIntegration?.slice(0, 300) ?? 'Not specified — ensure new pages are linked from existing navigation'}`
         : '';
 
     return `You are an expert software project planner for an AI coding swarm.
@@ -147,7 +154,11 @@ Rules:
 - Reference specific available services in acceptance criteria where relevant
   (e.g., "Use OpenAI to classify post sentiment" not just "filter negative posts")
 - Order nodes so dependencies flow naturally (earlier nodes don't depend on later ones)
-- A COMPOSITE must have at least 2 nodes`;
+- A COMPOSITE must have at least 2 nodes
+- NAVIGATION RULE: When a task creates a new page or route, there MUST be a task (or acceptance
+  criterion within a task) that adds a navigation link from existing pages to the new page.
+  Users must be able to discover and reach the new feature from the main site. Check the design
+  spec's Navigation field for where the link should go. A new page with no entry point is a blocker.`;
 }
 
 // ── Main class ────────────────────────────────────────────────────────────────
@@ -181,15 +192,29 @@ export class ProjectManager extends BaseAgent {
             logger.warn(`[${this.agentId}] Research failed (non-fatal):`, err);
         }
 
+        // ── EXPLORE ───────────────────────────────────────────────────────────
+        // Site Explorer browses the live frontend to understand current state.
+        // Provides visual context (screenshots) for the UX Designer.
+        this.emit('STATE_CHANGED', { message: 'Exploring current site...', phase: 'explore' });
+        const explorerId = `site-explorer.${uuidv4().slice(0, 8)}`;
+        const explorer = new SiteExplorer(explorerId, this.traceId);
+        let siteExploration: SiteExplorationResult | undefined;
+        try {
+            siteExploration = await explorer.run(enrichedObjective);
+            logger.info(`[${this.agentId}] Site exploration complete: ${siteExploration.pages.length.toString()} pages captured`);
+        } catch (err) {
+            logger.warn(`[${this.agentId}] Site exploration failed (non-fatal):`, err);
+        }
+
         // ── DESIGN ────────────────────────────────────────────────────────────
         // UX Designer produces a design spec that feeds into decomposition,
-        // SWE objectives, and QA visual validation.
+        // SWE objectives, and QA visual validation. Now receives site screenshots.
         this.emit('STATE_CHANGED', { message: 'Designing user experience...', phase: 'design' });
         const designerId = `ux-designer.${uuidv4().slice(0, 8)}`;
         const designer = new UxDesigner(designerId, this.traceId);
         let designSpec: UxDesignSpec | null = null;
         try {
-            designSpec = await designer.run(enrichedObjective, researchSummary);
+            designSpec = await designer.run(enrichedObjective, researchSummary, siteExploration);
             logger.info(`[${this.agentId}] UX design complete: ${designSpec.layout.slice(0, 100)}`);
         } catch (err) {
             logger.warn(`[${this.agentId}] Design phase failed (non-fatal):`, err);
@@ -555,10 +580,18 @@ export class ProjectManager extends BaseAgent {
                     continue;
                 }
 
+                // ── RESTART DEV SERVERS ──────────────────────────────────────
+                // SWE code changes often crash/corrupt the running dev servers
+                // (hot-reload failures, 500s after recompile). Kill and restart
+                // them cleanly before QA probes anything.
+                if (sandbox !== undefined) {
+                    await this.#restartSandboxServers(artifact, sandbox);
+                }
+
                 // ── VALIDATE ─────────────────────────────────────────────────
                 const qaId = `qa-engineer.${uuidv4().slice(0, 8)}`;
                 const qa = new QaEngineer(qaId, this.traceId);
-                const verdict = await qa.run(node.objective, node.acceptanceCriteria, artifact, deployedServiceUrl, sandbox, designSpec, graph);
+                const verdict = await qa.run(node.objective, node.acceptanceCriteria, artifact, deployedServiceUrl, sandbox, designSpec, graph, priorIssues.length > 0 ? priorIssues : undefined);
 
                 if (verdict.passed) {
                     passed = true;
@@ -587,7 +620,7 @@ export class ProjectManager extends BaseAgent {
         }
 
         if (!passed) {
-            const failSummary = `Failed QA after ${(MAX_RETRIES + 1).toString()} attempts. Last issues: ${priorIssues.join('; ')}`;
+            const failSummary = `Failed QA after ${(MAX_RETRIES + 1).toString()} attempt(s). Last issues: ${priorIssues.join('; ').slice(0, 300)}`;
             this.#emitSweEvent(sweId, 'STATE_CHANGED', {
                 message: failSummary,
                 phase: 'implement',
@@ -764,6 +797,119 @@ export class ProjectManager extends BaseAgent {
             },
         } as unknown as import('@ai-hivemind/shared').SystemEvent);
         void graph; // suppress unused var
+    }
+
+    /**
+     * Kill and restart dev servers inside the sandbox container.
+     *
+     * After the SWE modifies code, Next.js/backend hot-reload can leave servers
+     * in a bad state (500 errors, crash loops). This method:
+     *  1. Kills all node processes inside the container
+     *  2. Restarts backend + frontend dev servers
+     *  3. Polls until they respond to health checks (max 60s)
+     *
+     * Non-fatal — if restart fails, QA will detect the issue and report it.
+     */
+    async #restartSandboxServers(artifact: SweArtifact, sandbox: SandboxHandle): Promise<void> {
+        const { containerName, workDir, backendPort, webPort } = sandbox;
+        const hasBackendFiles = artifact.filesChanged.some((f) => f.includes('apps/backend'));
+        const hasFrontendFiles = artifact.filesChanged.some((f) => f.includes('apps/web'));
+
+        this.emit('STATE_CHANGED', {
+            message: 'Restarting dev servers before QA...',
+            phase: 'validate',
+        });
+
+        // Kill existing node processes (dev servers, watchers)
+        try {
+            execSync(
+                `docker exec ${containerName} sh -c "pkill -f 'node|next|tsx' 2>/dev/null; sleep 1; pkill -9 -f 'node|next|tsx' 2>/dev/null; true"`,
+                { stdio: 'pipe', timeout: 10_000 },
+            );
+            logger.info(`[${this.agentId}] Killed existing node processes in ${containerName}`);
+        } catch {
+            // pkill returns non-zero if no processes found — that's fine
+        }
+
+        // Brief pause to let ports free up
+        await sleep(2_000);
+
+        // Restart servers
+        const servers: Array<{ filter: string; label: string; port: number; healthPath: string }> = [];
+        if (hasBackendFiles || hasFrontendFiles) {
+            // Always restart both if either changed — they may depend on each other
+            servers.push(
+                { filter: '@ai-hivemind/backend', label: 'backend', port: backendPort, healthPath: '/health' },
+                { filter: '@ai-hivemind/web', label: 'frontend', port: webPort, healthPath: '/' },
+            );
+        }
+
+        for (const { filter, label, port } of servers) {
+            const cmd = `cd ${workDir} && PORT=${port.toString()} pnpm --filter ${filter} dev > /tmp/${label}.log 2>&1 &`;
+            try {
+                execSync(
+                    `docker exec ${containerName} sh -c ${JSON.stringify(cmd)}`,
+                    { stdio: 'pipe', timeout: 10_000 },
+                );
+                logger.info(`[${this.agentId}] Restarted ${label} on port ${port.toString()}`);
+            } catch (e) {
+                logger.warn(`[${this.agentId}] Failed to restart ${label}:`, e);
+            }
+        }
+
+        if (servers.length === 0) return;
+
+        // Poll until servers respond (max 60s)
+        const ready = new Set<string>();
+        const maxWait = 60_000;
+        const pollInterval = 3_000;
+        let elapsed = 0;
+
+        while (elapsed < maxWait && ready.size < servers.length) {
+            await sleep(pollInterval);
+            elapsed += pollInterval;
+
+            for (const { label, port, healthPath } of servers) {
+                if (ready.has(label)) continue;
+                try {
+                    execSync(
+                        `curl -sf --max-time 3 http://localhost:${port.toString()}${healthPath}`,
+                        { stdio: 'pipe' },
+                    );
+                    ready.add(label);
+                    logger.info(`[${this.agentId}] ${label} ready after restart (${elapsed.toString()}ms)`);
+                } catch {
+                    // Not ready yet
+                }
+            }
+        }
+
+        // Warm up frontend routes so Next.js compiles them before QA
+        const warmupUrls: string[] = [];
+        for (const f of artifact.filesChanged) {
+            const match = /apps\/web\/src\/app\/(.+?)\/page\.tsx$/.exec(f);
+            if (match?.[1] !== undefined) {
+                warmupUrls.push(`http://localhost:${webPort.toString()}/${match[1]}`);
+            }
+        }
+        if (warmupUrls.length > 0) {
+            logger.info(`[${this.agentId}] Warming up ${warmupUrls.length.toString()} route(s) after restart`);
+            for (const url of warmupUrls) {
+                try {
+                    execSync(`curl -sf --max-time 15 "${url}" > /dev/null 2>&1`, { stdio: 'pipe', timeout: 20_000 });
+                } catch {
+                    // Non-fatal — QA will handle compilation
+                }
+            }
+            await sleep(2_000);
+        }
+
+        const missing = servers.filter((s) => !ready.has(s.label)).map((s) => s.label);
+        if (missing.length > 0) {
+            logger.warn(`[${this.agentId}] Servers not ready after restart: ${missing.join(', ')}`);
+        } else {
+            logger.info(`[${this.agentId}] All servers restarted successfully`);
+        }
     }
 
     /**

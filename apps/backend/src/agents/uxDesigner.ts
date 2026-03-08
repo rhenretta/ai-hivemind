@@ -11,6 +11,11 @@
  *   - SWE objective: guides implementation (layout, components, styling)
  *   - QA prompt: visual validation benchmark
  *
+ * Enhanced capabilities:
+ *   - Receives screenshots from SiteExplorer (vision messages)
+ *   - ask_engineer tool: queries codebase via inner LLM with read_file access
+ *   - Navigation integration: ensures new features are reachable from existing nav
+ *
  * Tier 2 constraints:
  *  - No spawning of sub-agents
  *  - Read-only tool binding (no file writes, no shell commands)
@@ -29,6 +34,8 @@ import type { UxDesignSpec } from '@ai-hivemind/shared';
 import { UxDesignSpecSchema } from '@ai-hivemind/shared';
 import type OpenAI from 'openai';
 
+import type { SiteExplorationResult } from './siteExplorer.js';
+
 // ── System prompt ──────────────────────────────────────────────────────────────
 
 function buildDesignerSystemPrompt(objective: string, researchContext: string): string {
@@ -42,6 +49,8 @@ Your design spec will be handed to a Software Engineer (who implements it) and a
 - **Information hierarchy**: What's most important? Make it prominent.
 - **Modern UI patterns**: Cards, grids, full-bleed layouts, floating actions, bottom sheets.
 - **Interaction design**: How does the user navigate, filter, scroll, interact?
+- **Discoverability & Navigation**: Every new feature MUST be reachable from existing navigation. Specify exactly where the link should go (header nav, sidebar, homepage card, etc.) and what it should look like. A page with no entry point is a deployment blocker.
+- **Contextual Integration**: New features should feel like a natural extension of the existing site — match existing navigation patterns, visual style, and layout conventions. If you have screenshots of the current site, reference them.
 - **Mobile-first**: Design for mobile viewports, scale up for desktop.
 - **Visual polish**: Professional typography, deliberate spacing, subtle shadows, smooth transitions.
 - **Accessibility**: Readable contrast, keyboard navigation, semantic HTML.
@@ -60,17 +69,19 @@ ${researchContext}
 
 ## Instructions
 
-1. Use your tools if helpful (web_search for design inspiration, query_rag for project patterns)
-2. Design the complete user experience for the feature
-3. Output ONLY a JSON object — no preamble, no explanation, no markdown. Just the raw JSON:
+1. Use your tools if helpful (web_search for design inspiration, query_rag for project patterns, ask_engineer for codebase questions)
+2. If screenshots of the current site are provided, study them carefully to understand existing patterns
+3. Design the complete user experience for the feature, including how it connects to existing navigation
+4. Output ONLY a JSON object — no preamble, no explanation, no markdown. Just the raw JSON:
 
 {
   "layout": "Detailed description of the page/feature layout. Be specific about positioning, sizing, and responsive behavior.",
   "componentHierarchy": "Component tree showing nesting. E.g.: Page > Header + ContentArea > PostCard > (Title + Meta + Body + Actions)",
-  "userFlow": "Numbered step-by-step description of how the user interacts with the feature from start to finish.",
+  "userFlow": "Numbered step-by-step description of how the user interacts with the feature from start to finish. MUST start with how the user discovers/navigates to this feature.",
   "styling": "Specific styling decisions: color scheme, typography (font sizes, weights), spacing scale, shadow levels, border radius, animations/transitions.",
   "wireframe": "ASCII wireframe of the primary screen. Use box-drawing characters for structure.",
-  "uxAcceptanceCriteria": "Bullet-pointed list of specific, verifiable UX requirements. Each must be testable by looking at the rendered page."
+  "uxAcceptanceCriteria": "Bullet-pointed list of specific, verifiable UX requirements. Each must be testable by looking at the rendered page.",
+  "navigationIntegration": "How the user reaches this feature from the existing site. Specify: which nav component gets the link (header, sidebar, homepage), the link text, any icon, and whether it fits in an existing nav section or needs a new one."
 }
 
 ## CRITICAL OUTPUT FORMAT
@@ -105,6 +116,23 @@ const DESIGNER_VIRTUAL_TOOLS: OpenAI.ChatCompletionTool[] = [
             },
         },
     },
+    {
+        type: 'function',
+        function: {
+            name: 'ask_engineer',
+            description: 'Ask a technical question about the current codebase implementation. '
+                + 'Use to understand: existing components, routing patterns, navigation structure, '
+                + 'data flow, page layouts. Examples: "What components does the homepage render?", '
+                + '"How does the sidebar navigation work?", "What API endpoints exist?"',
+            parameters: {
+                type: 'object',
+                properties: {
+                    question: { type: 'string', description: 'Technical question about the codebase' },
+                },
+                required: ['question'],
+            },
+        },
+    },
 ];
 
 const MAX_TURNS = 6;
@@ -118,7 +146,11 @@ export class UxDesigner extends BaseAgent {
         super(agentId, traceId);
     }
 
-    async run(objective: string, researchContext: string): Promise<UxDesignSpec> {
+    async run(
+        objective: string,
+        researchContext: string,
+        siteExploration?: SiteExplorationResult,
+    ): Promise<UxDesignSpec> {
         this.spawn('ux-designer');
         this.emit('STATE_CHANGED', {
             message: `Designing UX for: "${objective}"`,
@@ -137,8 +169,41 @@ export class UxDesigner extends BaseAgent {
         const systemPrompt = buildDesignerSystemPrompt(objective, researchContext);
         const messages: OpenAI.ChatCompletionMessageParam[] = [
             { role: 'system', content: systemPrompt },
-            { role: 'user', content: `Design the UX for this feature:\n\n${objective}` },
         ];
+
+        // Build user message — include site screenshots as vision messages if available
+        const hasSiteContext = siteExploration !== undefined
+            && siteExploration.pages.length > 0;
+
+        if (hasSiteContext) {
+            const userContent: OpenAI.ChatCompletionContentPart[] = [
+                {
+                    type: 'text',
+                    text: `Design the UX for this feature:\n\n${objective}\n\n`
+                        + `## Current Site State\n${siteExploration!.navigationStructure}\n\n`
+                        + `## Existing Features\n${siteExploration!.existingFeatures}`,
+                },
+            ];
+
+            // Attach up to 4 screenshots for vision analysis
+            for (const page of siteExploration!.pages.slice(0, 4)) {
+                userContent.push(
+                    { type: 'text', text: `Screenshot of ${page.url} ("${page.title}"):` },
+                    { type: 'image_url', image_url: { url: `data:image/png;base64,${page.screenshotB64}`, detail: 'high' } },
+                );
+            }
+
+            messages.push({ role: 'user', content: userContent });
+            logger.info(`[${this.agentId}] Injected ${Math.min(siteExploration!.pages.length, 4).toString()} site screenshots as vision context`);
+        } else {
+            // Text-only context (no site exploration or no screenshots captured)
+            let textContent = `Design the UX for this feature:\n\n${objective}`;
+            if (siteExploration !== undefined) {
+                textContent += `\n\n## Current Site State\n${siteExploration.navigationStructure}`
+                    + `\n\n## Existing Features\n${siteExploration.existingFeatures}`;
+            }
+            messages.push({ role: 'user', content: textContent });
+        }
 
         let designText = '';
 
@@ -194,6 +259,7 @@ export class UxDesigner extends BaseAgent {
                 styling: spec.styling,
                 wireframe: spec.wireframe,
                 uxAcceptanceCriteria: spec.uxAcceptanceCriteria,
+                navigationIntegration: spec.navigationIntegration,
             },
         });
         this.terminate('design_complete');
@@ -214,11 +280,133 @@ export class UxDesigner extends BaseAgent {
             return results.map((r) => `[${r.entry.tags.join(', ')}] ${r.entry.content}`).join('\n---\n');
         }
 
+        if (name === 'ask_engineer') {
+            const question = String(args['question'] ?? '');
+            return await this.#askEngineer(question);
+        }
+
         if (!READ_ONLY_TOOLS.has(name)) {
             return `Tool '${name}' is not authorized for UxDesigner.`;
         }
 
         return await executeTool(name, args);
+    }
+
+    /**
+     * Inner LLM call that answers codebase questions for the UX Designer.
+     * Has access to read_file and query_rag tools so it can look up actual
+     * source code to answer questions about navigation, components, etc.
+     */
+    async #askEngineer(question: string): Promise<string> {
+        logger.info(`[${this.agentId}] ask_engineer: "${question.slice(0, 100)}"`);
+
+        // 1. Gather context from multiple RAG collections
+        const ragContext: string[] = [];
+        for (const collection of ['default', 'research-context', 'ux-designs']) {
+            try {
+                const results = ragStore.queryContext(collection, question);
+                for (const r of results) {
+                    ragContext.push(`[${collection}] ${r.entry.content.slice(0, 500)}`);
+                }
+            } catch {
+                // Collection may not exist yet — skip
+            }
+        }
+
+        // 2. Build tools for the inner LLM (read_file + query_rag)
+        const innerTools: OpenAI.ChatCompletionTool[] = [
+            {
+                type: 'function',
+                function: {
+                    name: 'read_file',
+                    description: 'Read a file from the project. Use to examine source code, component structure, routing config.',
+                    parameters: {
+                        type: 'object',
+                        properties: {
+                            path: { type: 'string', description: 'File path relative to monorepo root or absolute path' },
+                        },
+                        required: ['path'],
+                    },
+                },
+            },
+            {
+                type: 'function',
+                function: {
+                    name: 'query_rag',
+                    description: 'Query the knowledge base for project context.',
+                    parameters: {
+                        type: 'object',
+                        properties: {
+                            query: { type: 'string', description: 'Search query' },
+                            collection: { type: 'string', description: 'Collection name', default: 'default' },
+                        },
+                        required: ['query'],
+                    },
+                },
+            },
+        ];
+
+        const contextSection = ragContext.length > 0
+            ? `\n\nRelevant context from knowledge base:\n${ragContext.join('\n---\n')}`
+            : '';
+
+        const innerMessages: OpenAI.ChatCompletionMessageParam[] = [
+            {
+                role: 'system',
+                content: 'You are a software engineer answering questions about the codebase for a UX designer. '
+                    + 'Use read_file to look up source code when needed. Be concise and factual. '
+                    + 'Focus on: component structure, routing, navigation, page layouts, data flow.',
+            },
+            {
+                role: 'user',
+                content: `Question: ${question}${contextSection}`,
+            },
+        ];
+
+        // 3. Multi-turn inner LLM call (max 3 turns)
+        try {
+            for (let turn = 0; turn < 3; turn++) {
+                const completion = await generateWithRawTools(innerMessages, innerTools, 'low');
+                const choice = completion.choices[0];
+                if (choice === undefined) break;
+
+                innerMessages.push(choice.message);
+
+                if (choice.finish_reason !== 'tool_calls') {
+                    return extractTextContent(completion);
+                }
+
+                // Dispatch inner tool calls
+                for (const call of choice.message.tool_calls ?? []) {
+                    const fnCall = call as OpenAI.ChatCompletionMessageToolCall & {
+                        function: { name: string; arguments: string };
+                    };
+                    const innerArgs = JSON.parse(fnCall.function.arguments) as Record<string, unknown>;
+                    let result: string;
+
+                    if (fnCall.function.name === 'read_file') {
+                        result = await executeTool('read_file', innerArgs);
+                    } else if (fnCall.function.name === 'query_rag') {
+                        const q = String(innerArgs['query'] ?? '');
+                        const c = String(innerArgs['collection'] ?? 'default');
+                        const results = ragStore.queryContext(c, q);
+                        result = results.length === 0
+                            ? 'No relevant context found.'
+                            : results.map((r) => r.entry.content.slice(0, 500)).join('\n---\n');
+                    } else {
+                        result = `Unknown tool: ${fnCall.function.name}`;
+                    }
+
+                    innerMessages.push({ role: 'tool', tool_call_id: call.id, content: result });
+                }
+            }
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            logger.warn(`[${this.agentId}] ask_engineer failed: ${msg}`);
+            return `Could not answer: ${msg}`;
+        }
+
+        return 'Could not determine an answer within the turn limit.';
     }
 
     /** Try to validate a JSON string as a UxDesignSpec, returning the parsed result or null */
@@ -401,7 +589,7 @@ export class UxDesigner extends BaseAgent {
                 ...messages,
                 {
                     role: 'user',
-                    content: 'Your previous response could not be parsed as JSON. Please output the UX design spec as a SINGLE valid JSON object with these exact keys: layout, componentHierarchy, userFlow, styling, wireframe, uxAcceptanceCriteria. All values must be strings. Output ONLY the JSON.',
+                    content: 'Your previous response could not be parsed as JSON. Please output the UX design spec as a SINGLE valid JSON object with these exact keys: layout, componentHierarchy, userFlow, styling, wireframe, uxAcceptanceCriteria, navigationIntegration. All values must be strings. Output ONLY the JSON.',
                 },
             ];
 

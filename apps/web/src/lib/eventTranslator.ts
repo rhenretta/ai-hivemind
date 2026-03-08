@@ -42,7 +42,7 @@ export function translateEvent(event: SystemEvent): string | null {
             // Hide PM orchestration phases — redundant with child agent rows
             // (Data Researcher, UX Designer, SWE appear as their own rows)
             if (typeof sourceId === 'string' && sourceId.startsWith('project-manager')) {
-                const hiddenPhases = new Set(['start', 'research', 'design', 'decompose', 'propose']);
+                const hiddenPhases = new Set(['start', 'research', 'design', 'decompose', 'propose', 'explore']);
                 if (phase !== null && hiddenPhases.has(phase)) {
                     return null;
                 }
@@ -80,9 +80,61 @@ export function translateEvent(event: SystemEvent): string | null {
                     return `QA running: ${shortCmd}`;
                 }
                 if (toolName === 'screenshot_url') return 'QA taking screenshot';
+                if (toolName === 'browser_navigate') {
+                    const navInput = payload['input'] as Record<string, unknown> | undefined;
+                    const navUrl = typeof navInput?.['url'] === 'string' ? navInput['url'] : '';
+                    return navUrl !== '' ? `QA navigating to: ${navUrl}` : 'QA navigating browser';
+                }
+                if (toolName === 'browser_screenshot') return 'QA taking screenshot';
+                if (toolName === 'browser_click') {
+                    const clickInput = payload['input'] as Record<string, unknown> | undefined;
+                    const clickSel = typeof clickInput?.['selector'] === 'string' ? clickInput['selector'] : '';
+                    return `QA clicking: ${clickSel}`;
+                }
+                if (toolName === 'browser_fill') {
+                    const fillInput = payload['input'] as Record<string, unknown> | undefined;
+                    const fillSel = typeof fillInput?.['selector'] === 'string' ? fillInput['selector'] : '';
+                    return `QA filling form: ${fillSel}`;
+                }
+                if (toolName === 'browser_wait_for') {
+                    const waitInput = payload['input'] as Record<string, unknown> | undefined;
+                    const waitSel = typeof waitInput?.['selector'] === 'string' ? waitInput['selector'] : '';
+                    const waitState = typeof waitInput?.['state'] === 'string' ? waitInput['state'] : 'visible';
+                    return `QA waiting for: ${waitSel} (${waitState})`;
+                }
+                if (toolName === 'browser_get_text') return 'QA reading page text';
+                if (toolName === 'browser_evaluate') return 'QA running page script';
                 if (toolName === 'update_test_plan') return 'QA updating test plan';
                 if (toolName === 'submit_qa_verdict') return 'QA submitting verdict';
                 return `QA: ${toolName}`;
+            }
+
+            if (phase === 'explore') {
+                // Site Explorer agent tool calls
+                if (toolName === 'browser_navigate') {
+                    const navInput = payload['input'] as Record<string, unknown> | undefined;
+                    const navUrl = typeof navInput?.['url'] === 'string' ? navInput['url'] : '';
+                    return navUrl !== '' ? `Exploring: ${navUrl}` : 'Exploring site';
+                }
+                if (toolName === 'browser_screenshot') return 'Capturing page screenshot';
+                if (toolName === 'browser_get_text') return 'Reading page content';
+                if (toolName === 'browser_evaluate') return 'Analyzing page structure';
+                if (toolName === 'browser_click') {
+                    const clickInput = payload['input'] as Record<string, unknown> | undefined;
+                    const clickSel = typeof clickInput?.['selector'] === 'string' ? clickInput['selector'] : '';
+                    return clickSel !== '' ? `Exploring link: ${clickSel}` : 'Exploring navigation';
+                }
+                if (toolName === 'submit_exploration') return 'Cataloging site structure';
+                return `Exploring: ${toolName}`;
+            }
+
+            if (phase === 'design') {
+                // UX Designer ask_engineer tool calls
+                if (toolName === 'ask_engineer') {
+                    const aeInput = payload['input'] as Record<string, unknown> | undefined;
+                    const question = typeof aeInput?.['question'] === 'string' ? aeInput['question'].slice(0, 80) : '';
+                    return question !== '' ? `Asking about codebase: ${question}` : 'Asking about codebase';
+                }
             }
 
             // Other agent tool calls (coordinator, data researcher)

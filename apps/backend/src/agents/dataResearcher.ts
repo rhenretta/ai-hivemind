@@ -34,6 +34,9 @@ Given a software objective, your job is to:
 3. Identify which files in the existing project may need to be modified (describe paths you know exist based on the project structure)
 4. Identify relevant tech stack details, patterns, and constraints
 5. Analyze which of the available external services (listed in the objective under "Available External Services") are relevant to this task and recommend HOW they should be used — this is critical for guiding downstream implementation
+6. Catalog all existing frontend page routes by examining the apps/web/src/app/ directory structure
+7. Identify the main navigation components (header, sidebar, footer) and what links they contain
+8. List existing user-facing features and how they connect to each other
 
 Output format (always return structured text under these exact headings):
 ## Prior Context
@@ -44,6 +47,11 @@ Output format (always return structured text under these exact headings):
 
 ## Key Files to Consider
 (paths + reason, based on known project structure)
+
+## Existing Routes & Navigation
+(List each route segment under apps/web/src/app/ and what it does.
+Describe the navigation structure: which nav components exist, what links they contain,
+and how new pages would typically be connected to existing navigation.)
 
 ## Constraints & Patterns
 (tech stack rules, naming conventions, patterns to follow)
