@@ -44,9 +44,13 @@ import {
     dependenciesMet,
     dependencyFailed,
     deriveGraphStatus,
+    appendNodes,
+    updatePendingNode,
 } from '@ai-hivemind/shared';
 import type { SweArtifact } from '@ai-hivemind/shared';
 import type { SystemEvent } from '@ai-hivemind/shared';
+
+import { getDialogueAgent } from '../services/dialogueAgent.js';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -235,9 +239,21 @@ export class ProjectManager extends BaseAgent {
         // Emit the initial graph — UI shows the plan
         this.#emitGraph(graph, 'Task graph created');
 
+        // Register graph with Dialogue Agent so it has context for conversation
+        const dialogueAgent = getDialogueAgent(this.traceId);
+        if (dialogueAgent !== undefined) {
+            dialogueAgent.setTaskGraph(graph);
+        }
+
         // ── EXECUTE ───────────────────────────────────────────────────────────
         const result = await this.#executeGraph(graph, researchSummary, designSpec);
         this.terminate(result.success ? 'task_complete' : 'task_failed');
+
+        // Notify Dialogue Agent of completion so it can send a summary to the user
+        if (dialogueAgent !== undefined) {
+            dialogueAgent.onExecutionComplete(result);
+        }
+
         return result.summary;
     }
 
@@ -328,7 +344,8 @@ export class ProjectManager extends BaseAgent {
 
     // ── Private — execute ─────────────────────────────────────────────────────
 
-    async #executeGraph(graph: TaskGraph, researchSummary: string, designSpec: UxDesignSpec | null = null): Promise<{ success: boolean; summary: string }> {
+    async #executeGraph(graph: TaskGraph, researchSummary: string, initialDesignSpec: UxDesignSpec | null = null): Promise<{ success: boolean; summary: string }> {
+        let designSpec = initialDesignSpec;
         const completedSummaries: string[] = [];
 
         // ── Feature sandbox ───────────────────────────────────────────────────
@@ -337,10 +354,75 @@ export class ProjectManager extends BaseAgent {
         const sandbox = await createFeatureSandbox(this.traceId);
         logger.info(`[${this.agentId}] Using feature sandbox container: ${sandbox.containerName}`);
 
+        // ── Subscribe to plan mutations from the Dialogue Agent ──────────────
+        // Mutations are queued and applied between node executions (never mid-node).
+        interface PlanMutation {
+            newNodes: Array<{ id: string; objective: string; acceptanceCriteria: string; taskType: string; dependsOn: string[] }>;
+            updatedNodes: Array<{ nodeId: string; objective?: string; acceptanceCriteria?: string }>;
+        }
+        const pendingMutations: PlanMutation[] = [];
+        const unsubMutations = eventBus.subscribe('DIALOGUE_UPDATE_PLAN', (event: SystemEvent) => {
+            if (event.traceId !== this.traceId) return;
+            pendingMutations.push({
+                newNodes: (event.payload['newNodes'] as PlanMutation['newNodes']) ?? [],
+                updatedNodes: (event.payload['updatedNodes'] as PlanMutation['updatedNodes']) ?? [],
+            });
+            logger.info(`[${this.agentId}] Queued plan mutation (${pendingMutations.length.toString()} pending)`);
+        });
+
         // Sequential loop: keep processing until no more pending nodes can run
         let madeProgress = true;
+        let mutationsApplied = false;
         while (madeProgress) {
             madeProgress = false;
+
+            // ── Apply queued plan mutations ──────────────────────────────────
+            while (pendingMutations.length > 0) {
+                const mutation = pendingMutations.shift()!;
+                try {
+                    // Add new nodes
+                    if (mutation.newNodes.length > 0) {
+                        const newTaskNodes: TaskNode[] = mutation.newNodes.map((n) => ({
+                            id: n.id,
+                            objective: n.objective,
+                            acceptanceCriteria: n.acceptanceCriteria,
+                            taskType: (n.taskType as TaskNode['taskType']) ?? 'fullstack',
+                            dependsOn: n.dependsOn,
+                            status: 'pending' as const,
+                            isAtomic: true,
+                        }));
+                        appendNodes(graph, newTaskNodes);
+                        logger.info(`[${this.agentId}] Appended ${newTaskNodes.length.toString()} new nodes`);
+                    }
+                    // Update pending nodes
+                    for (const update of mutation.updatedNodes) {
+                        const patch: { objective?: string; acceptanceCriteria?: string } = {};
+                        if (update.objective !== undefined) patch.objective = update.objective;
+                        if (update.acceptanceCriteria !== undefined) patch.acceptanceCriteria = update.acceptanceCriteria;
+                        updatePendingNode(graph, update.nodeId, patch);
+                        logger.info(`[${this.agentId}] Updated pending node ${update.nodeId}`);
+                    }
+                    this.#emitGraph(graph, 'Plan updated with new requirements');
+                    mutationsApplied = true;
+                    madeProgress = true;
+                } catch (err) {
+                    const msg = err instanceof Error ? err.message : String(err);
+                    logger.warn(`[${this.agentId}] Plan mutation failed: ${msg}`);
+                }
+            }
+
+            // ── Reason about what the mutations require ──────────────────────
+            // When the user provides new requirements mid-execution, the PM
+            // reasons about what agents need to re-run (research, UX, neither)
+            // rather than blindly re-invoking anything.
+            if (mutationsApplied) {
+                mutationsApplied = false;
+                try {
+                    await this._handleMutationEffects(graph, researchSummary, designSpec, (spec) => { designSpec = spec; });
+                } catch (err) {
+                    logger.warn(`[${this.agentId}] Mutation effect handling failed (non-fatal):`, err);
+                }
+            }
 
             // First: mark any node whose dependency failed/skipped as 'skipped'
             for (const node of graph.nodes) {
@@ -380,6 +462,9 @@ export class ProjectManager extends BaseAgent {
             this.#emitGraph(graph, `[${nextNode.id}] ${nextNode.status}`);
         }
 
+        // Clean up mutation subscription
+        unsubMutations();
+
         const allDoneOrSkipped = graph.nodes.every((n: TaskNode) => n.status === 'done' || n.status === 'skipped');
         const failedNodes = graph.nodes.filter((n: TaskNode) => n.status === 'failed');
 
@@ -398,6 +483,109 @@ export class ProjectManager extends BaseAgent {
         const failMsg = failedNodes.map((n) => `[${n.id}]: ${n.error ?? 'unknown error'}`).join('; ');
         this.emit('ERROR', { message: `Task graph failed: ${failMsg}`, agentId: this.agentId });
         return { success: false, summary: `Failed tasks: ${failMsg}` };
+    }
+
+    /**
+     * Reason about what a set of plan mutations requires and selectively
+     * re-invoke agents (research, UX design, or nothing) as needed.
+     */
+    // eslint-disable-next-line @typescript-eslint/naming-convention
+    async _handleMutationEffects(
+        graph: TaskGraph,
+        researchSummary: string,
+        designSpec: UxDesignSpec | null,
+        setDesignSpec: (spec: UxDesignSpec) => void,
+    ): Promise<void> {
+        const pendingNodes = graph.nodes.filter((n) => n.status === 'pending');
+        if (pendingNodes.length === 0) return;
+
+        const pendingSummary = pendingNodes
+            .map((n) => `- [${n.id}] (${n.taskType}): ${n.objective}`)
+            .join('\n');
+
+        const currentDesign = designSpec !== null
+            ? `Layout: ${designSpec.layout}\nUser flow: ${designSpec.userFlow}\nNavigation: ${designSpec.navigationIntegration ?? 'N/A'}`
+            : 'No design spec exists yet.';
+
+        const prompt = `You are a project manager. The user just provided new requirements that changed the plan for a feature being built.
+
+## Current Feature
+${graph.rootObjective}
+
+## Current Design Spec
+${currentDesign}
+
+## Pending Tasks (updated with new requirements)
+${pendingSummary}
+
+## What to decide
+Given the updated pending tasks, decide what preparation is needed before the next task executes. Respond with ONLY a JSON object:
+
+{
+    "reasoning": "Brief explanation of what changed and what's needed",
+    "actions": {
+        "rerunUxDesign": true/false,
+        "rerunResearch": true/false
+    }
+}
+
+Guidelines:
+- rerunUxDesign=true if the changes affect layout, navigation, interaction patterns, visual design, or user flow (e.g., switching from buttons to infinite scroll)
+- rerunResearch=true if the changes require new technical knowledge the team doesn't have yet (e.g., a new API, unfamiliar library, or technology)
+- Both can be false if the changes are minor refinements that don't need new input (e.g., changing a label, adjusting a threshold)
+- Both can be true if the changes are significant enough to warrant fresh input from both agents`;
+
+        this.emit('STATE_CHANGED', { message: 'Evaluating new requirements...', phase: 'reasoning' });
+
+        const completion = await generateWithRawTools(
+            [{ role: 'system', content: prompt }],
+            [],
+            'low',
+        );
+        const raw = extractTextContent(completion).trim();
+        const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
+
+        let decision: { reasoning: string; actions: { rerunUxDesign: boolean; rerunResearch: boolean } };
+        try {
+            decision = JSON.parse(cleaned) as typeof decision;
+        } catch {
+            logger.warn(`[${this.agentId}] Mutation reasoning parse failed, skipping agent re-runs`);
+            return;
+        }
+
+        logger.info(`[${this.agentId}] Mutation reasoning: ${decision.reasoning}`);
+
+        // Re-run research if needed
+        if (decision.actions.rerunResearch) {
+            try {
+                this.emit('STATE_CHANGED', { message: 'Researching new requirements...', phase: 'research' });
+                const researcherId = `data-researcher.${uuidv4().slice(0, 8)}`;
+                const researcher = new DataResearcher(researcherId, this.traceId);
+                const result = await researcher.run(`${graph.rootObjective}\n\nFocus on: ${pendingSummary}`);
+                logger.info(`[${this.agentId}] Research refreshed after mutation: ${result.summary.slice(0, 100)}`);
+            } catch (err) {
+                logger.warn(`[${this.agentId}] Research refresh failed (non-fatal):`, err);
+            }
+        }
+
+        // Re-run UX design if needed
+        if (decision.actions.rerunUxDesign) {
+            try {
+                this.emit('STATE_CHANGED', { message: 'Updating UX design for new requirements...', phase: 'design' });
+                const refreshId = `ux-designer.${uuidv4().slice(0, 8)}`;
+                const refreshDesigner = new UxDesigner(refreshId, this.traceId);
+                const updatedObjective = `${graph.rootObjective}\n\nUpdated pending tasks:\n${pendingSummary}`;
+                const newSpec = await refreshDesigner.run(updatedObjective, researchSummary);
+                setDesignSpec(newSpec);
+                logger.info(`[${this.agentId}] UX design refreshed after mutation`);
+            } catch (err) {
+                logger.warn(`[${this.agentId}] UX design refresh failed (non-fatal):`, err);
+            }
+        }
+
+        if (!decision.actions.rerunResearch && !decision.actions.rerunUxDesign) {
+            logger.info(`[${this.agentId}] No agent re-runs needed for this mutation`);
+        }
     }
 
     async #executeNode(node: TaskNode, researchSummary: string, sandbox: SandboxHandle, designSpec: UxDesignSpec | null = null, graph?: TaskGraph): Promise<{ success: boolean; summary: string }> {

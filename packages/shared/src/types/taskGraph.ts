@@ -107,3 +107,50 @@ export function deriveGraphStatus(graph: TaskGraph): TaskStatus {
     if (statuses.some((s) => s === 'active')) return 'active';
     return 'pending';
 }
+
+/**
+ * Append new nodes to a running graph. Only adds — never modifies existing nodes.
+ * Validates that all dependsOn references point to existing node IDs.
+ * All new nodes are set to 'pending' status.
+ */
+export function appendNodes(graph: TaskGraph, newNodes: TaskNode[]): void {
+    const existingIds = new Set(graph.nodes.map((n) => n.id));
+
+    for (const node of newNodes) {
+        if (existingIds.has(node.id)) {
+            throw new Error(`Node "${node.id}" already exists in the graph`);
+        }
+        for (const depId of node.dependsOn) {
+            if (!existingIds.has(depId)) {
+                throw new Error(`Node "${node.id}" depends on unknown node "${depId}"`);
+            }
+        }
+        node.status = 'pending';
+        graph.nodes.push(node);
+        existingIds.add(node.id);
+    }
+}
+
+/**
+ * Update the objective and/or acceptance criteria of a pending node.
+ * Throws if the node does not exist or is not in 'pending' status.
+ */
+export function updatePendingNode(
+    graph: TaskGraph,
+    nodeId: string,
+    patch: { objective?: string; acceptanceCriteria?: string },
+): void {
+    const node = graph.nodes.find((n) => n.id === nodeId);
+    if (node === undefined) {
+        throw new Error(`Node "${nodeId}" not found in graph`);
+    }
+    if (node.status !== 'pending') {
+        throw new Error(`Cannot modify node "${nodeId}" — status is "${node.status}", not "pending"`);
+    }
+    if (patch.objective !== undefined) {
+        node.objective = patch.objective;
+    }
+    if (patch.acceptanceCriteria !== undefined) {
+        node.acceptanceCriteria = patch.acceptanceCriteria;
+    }
+}

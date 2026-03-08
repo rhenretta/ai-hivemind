@@ -108,6 +108,16 @@ export const SystemEventTypeSchema = z.enum([
      * Payload: { text: string, source: 'stdout' | 'stderr' | 'backend' | 'frontend' }
      */
     'SANDBOX_LOG',
+    /**
+     * Conversational message from the Dialogue Agent back to the user.
+     * Payload: { text: string, conversationPhase: string, suggestedQuestions?: string[] }
+     */
+    'DIALOGUE_RESPONSE',
+    /**
+     * Dialogue Agent requests mutation to a running task graph.
+     * Payload: { newNodes?: TaskNode[], updatedNodes?: { nodeId: string, objective?: string, acceptanceCriteria?: string }[] }
+     */
+    'DIALOGUE_UPDATE_PLAN',
 ]);
 export type SystemEventType = z.infer<typeof SystemEventTypeSchema>;
 

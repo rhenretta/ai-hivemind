@@ -608,6 +608,17 @@ IMPORTANT RULES:
 - **TIMEOUT RETRY RULE:** If browser_wait_for times out, consider whether you used a long enough timeout
   for the data flow. If the page fetches from an external API and you used < 45000ms, RETRY with a longer
   timeout before reporting failure. A short timeout is YOUR mistake, not a code bug.
+- **SEMANTIC VALIDATION RULE (CRITICAL):** When testing features that involve content quality, sentiment
+  analysis, content filtering, or any subjective evaluation, you MUST use YOUR OWN reasoning to evaluate
+  the content — NOT keyword matching, regex patterns, or word lists. Keyword matching is fundamentally
+  flawed for these tasks (e.g. "news" is not inherently negative, "politics" subreddit doesn't mean
+  political content in a post). Instead:
+    ✅ Fetch the data with http_get, then REASON about each item yourself ("This post about a puppy
+       rescue is positive. This post about a political scandal is political. 2 of 10 posts violate filters.")
+    ✅ Use browser_get_text to read displayed content, then evaluate whether it meets the criteria
+    ❌ NEVER write jq/grep/regex commands to check for keyword lists (e.g. \`test("politics|hate|bad")\`)
+    ❌ NEVER use word-matching heuristics as a proxy for understanding content
+  You are an AI — use your comprehension abilities instead of crude string matching.
 
 BAD TEST PLAN (never do this):
   [{ id: "check-all", name: "Check everything", description: "Test the whole feature", ... }]

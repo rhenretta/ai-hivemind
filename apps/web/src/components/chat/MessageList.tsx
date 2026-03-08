@@ -43,8 +43,8 @@ export function MessageList({ messages, isAiTyping }: MessageListProps) {
                         What would you like to build?
                     </h2>
                     <p className="text-sm text-muted-foreground">
-                        Describe a feature you want for your site. I&apos;ll help you plan it out
-                        and build it for you.
+                        Tell me about something you&apos;d like to build &mdash; I&apos;ll help you
+                        think it through and start building as we go.
                     </p>
                 </div>
             </div>

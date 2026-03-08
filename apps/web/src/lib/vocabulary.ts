@@ -38,6 +38,8 @@ const VISIBLE_EVENT_TYPES = new Set<SystemEventType>([
     'ERROR',
     'STATE_CHANGED',
     'FEATURE_DEPLOYED',
+    'DIALOGUE_RESPONSE',
+    'DIALOGUE_UPDATE_PLAN',
 ]);
 
 export function isVisibleEvent(eventType: SystemEventType): boolean {

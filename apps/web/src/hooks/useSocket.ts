@@ -64,29 +64,32 @@ function routeEvent(event: SystemEvent): void {
 
     switch (event.eventType) {
         case 'USER_COMMAND': {
-            const intent = event.payload['intent'] as string | undefined;
             const existing = featureStore.features[traceId];
 
             // Reconstruct user chat message from the ledger event
             // (ChatInput adds these optimistically, but they're lost on page reload)
-            const userText = typeof event.payload['originalText'] === 'string'
-                ? event.payload['originalText']
-                : typeof event.payload['objective'] === 'string'
-                    ? event.payload['objective']
-                    : null;
-            if (userText !== null) {
-                chatStore.appendMessage({
-                    id: event.eventId,
-                    role: 'user',
-                    text: userText,
-                    timestamp: event.timestamp,
-                    traceId,
-                    type: 'text',
-                });
+            // Skip when sourceId is 'dialogue-agent' — these are internal work triggers,
+            // not actual user messages.
+            if (event.sourceId !== 'dialogue-agent') {
+                const userText = typeof event.payload['originalText'] === 'string'
+                    ? event.payload['originalText']
+                    : typeof event.payload['objective'] === 'string'
+                        ? event.payload['objective']
+                        : null;
+                if (userText !== null) {
+                    chatStore.appendMessage({
+                        id: event.eventId,
+                        role: 'user',
+                        text: userText,
+                        timestamp: event.timestamp,
+                        traceId,
+                        type: 'text',
+                    });
+                }
             }
 
-            if (intent === 'continue_feature' && existing !== undefined) {
-                // Continue existing feature — reset status, don't overwrite title
+            if (event.sourceId === 'dialogue-agent' && existing !== undefined) {
+                // Work trigger from dialogue agent — update status to in_progress
                 featureStore.updateFeatureStatus(traceId, 'in_progress');
             } else if (existing === undefined) {
                 // New feature — use originalText (if available) for a clean title
@@ -111,28 +114,8 @@ function routeEvent(event: SystemEvent): void {
 
         case 'STATE_CHANGED': {
             if (event.payload['awaitingApproval'] === true) {
-                const proposal = event.payload['proposal'] as {
-                    title?: string;
-                    description?: string;
-                    steps?: string[];
-                } | undefined;
-
-                chatStore.appendMessage({
-                    id: uuid(),
-                    role: 'ai',
-                    text: typeof event.payload['message'] === 'string'
-                        ? event.payload['message']
-                        : 'I have a plan for this feature.',
-                    timestamp: event.timestamp,
-                    traceId,
-                    type: 'proposal',
-                    proposal: {
-                        title: proposal?.title ?? 'New Feature',
-                        description: proposal?.description ?? '',
-                        steps: proposal?.steps ?? [],
-                        status: 'proposed',
-                    },
-                });
+                // Update feature card status only — no chat message
+                // (the DialogueAgent handles conversation, not proposals)
                 featureStore.updateFeatureStatus(traceId, 'proposal');
                 chatStore.setAiTyping(false);
             } else if (event.payload['taskComplete'] === true) {
@@ -303,23 +286,40 @@ function routeEvent(event: SystemEvent): void {
             break;
         }
 
+        case 'DIALOGUE_RESPONSE': {
+            const dialogueText = typeof event.payload['text'] === 'string'
+                ? event.payload['text']
+                : 'The AI responded';
+
+            chatStore.appendMessage({
+                id: uuid(),
+                role: 'ai',
+                text: dialogueText,
+                timestamp: event.timestamp,
+                traceId,
+                type: 'dialogue',
+            });
+            chatStore.setAiTyping(false);
+
+            // During the exploring phase (before work starts), show "Thinking About It"
+            // instead of "Building" on the feature card
+            const phase = typeof event.payload['conversationPhase'] === 'string'
+                ? event.payload['conversationPhase']
+                : 'exploring';
+            if (phase === 'exploring') {
+                featureStore.updateFeatureStatus(traceId, 'proposal');
+            }
+            break;
+        }
+
         case 'FEATURE_DELETED': {
             featureStore.deleteFeature(traceId);
             break;
         }
 
         case 'ERROR': {
-            const message = typeof event.payload['message'] === 'string'
-                ? event.payload['message']
-                : 'Something went wrong';
-            chatStore.appendMessage({
-                id: uuid(),
-                role: 'ai',
-                text: `Something went wrong: ${message}`,
-                timestamp: event.timestamp,
-                traceId,
-                type: 'text',
-            });
+            // Update feature card status only — no chat message
+            // (user only wants to know when features are ready)
             featureStore.updateFeatureStatus(traceId, 'failed');
             chatStore.setAiTyping(false);
             break;
@@ -384,22 +384,9 @@ export function useSocket(): void {
                     stepsTotal: 0,
                     stepsComplete: 0,
                 });
-            } else {
-                // Show acknowledgment for continue/provide_input
-                const feature = featureState.features[data.traceId];
-                const featureTitle = feature?.title ?? 'the feature';
-                const ackText = data.intent === 'continue_feature'
-                    ? `Continuing work on "${featureTitle}"...`
-                    : `Sending your response to "${featureTitle}"...`;
-                chatState.appendMessage({
-                    id: uuid(),
-                    role: 'ai',
-                    text: ackText,
-                    timestamp: new Date().toISOString(),
-                    traceId: data.traceId,
-                    type: 'text',
-                });
             }
+            // No acknowledgment message for continue/provide_input —
+            // the DialogueAgent's DIALOGUE_RESPONSE handles conversation
         };
 
         ws.on('connect', onConnect);

@@ -9,6 +9,7 @@ import { ProjectManager } from './agents/projectManager.js';
 import { eventBus } from './eventBus.js';
 // Services — import triggers singleton creation + built-in tool seeding
 import { credentialStore } from './services/credentialStore.js';
+import { getOrCreateDialogueAgent, getMostRecentActiveAgent } from './services/dialogueAgent.js';
 import { classifyIntent, getFeatureSummaries, getRecentChatMessages } from './services/intentRouter.js';
 import { logger } from './services/logger.js';
 import { mcpRegistry } from './services/mcpRegistry.js';
@@ -316,6 +317,38 @@ io.on('connection', (socket: Socket) => {
 
         void (async () => {
             try {
+                // Fast path: if there's a recently active DialogueAgent, route there
+                // directly. This avoids the LLM intent classification round-trip and
+                // ensures conversational continuity (the agent has full history).
+                const recentAgent = getMostRecentActiveAgent();
+                if (recentAgent !== null) {
+                    const traceId = recentAgent.traceId;
+                    logger.info(`[Nerve Center] Routing to active DialogueAgent traceId=${traceId}`);
+
+                    socket.emit('intent:resolved', {
+                        clientEventId,
+                        traceId,
+                        intent: 'continue_feature',
+                        reasoning: 'Routed to active conversation',
+                    });
+
+                    // Persist user message in ledger for replay reconstruction.
+                    // sourceId='user' so the PM subscriber ignores it.
+                    eventBus.emit({
+                        eventId: clientEventId,
+                        timestamp: new Date().toISOString(),
+                        eventType: 'USER_COMMAND',
+                        sourceId: 'user',
+                        targetId: null,
+                        traceId,
+                        payload: { originalText: text, intent: 'continue_feature' },
+                    });
+
+                    void recentAgent.handleUserMessage(text);
+                    return;
+                }
+
+                // No active conversation — use intent router to determine feature routing
                 const features = getFeatureSummaries();
                 const recentMessages = getRecentChatMessages(10);
                 const result = await classifyIntent(text, features, recentMessages);
@@ -332,38 +365,26 @@ io.on('connection', (socket: Socket) => {
                     reasoning: result.reasoning,
                 });
 
-                if (result.intent === 'provide_input') {
-                    eventBus.emit({
-                        eventId: crypto.randomUUID(),
-                        timestamp: new Date().toISOString(),
-                        eventType: 'USER_INTERVENTION',
-                        sourceId: 'user',
-                        targetId: 'conductor',
-                        traceId,
-                        payload: { text, targetId: 'conductor' },
-                    });
-                } else {
-                    // new_feature or continue_feature
-                    eventBus.emit({
-                        eventId: clientEventId,
-                        timestamp: new Date().toISOString(),
-                        eventType: 'USER_COMMAND',
-                        sourceId: 'user',
-                        targetId: null,
-                        traceId,
-                        payload: {
-                            objective: result.enrichedObjective,
-                            traceId,
-                            originalText: text,
-                            intent: result.intent,
-                        },
-                    });
-                }
+                // Persist user message in ledger for replay reconstruction.
+                // sourceId='user' so the PM subscriber ignores it.
+                eventBus.emit({
+                    eventId: clientEventId,
+                    timestamp: new Date().toISOString(),
+                    eventType: 'USER_COMMAND',
+                    sourceId: 'user',
+                    targetId: null,
+                    traceId,
+                    payload: { originalText: text, intent: result.intent },
+                });
+
+                // Route through the Dialogue Agent.
+                const dialogueAgent = getOrCreateDialogueAgent(traceId);
+                void dialogueAgent.handleUserMessage(text);
             } catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);
                 logger.error(`[Nerve Center] user:message classification failed: ${msg}`);
 
-                // Fallback: treat as new feature
+                // Fallback: create a new Dialogue Agent and route message to it
                 const traceId = crypto.randomUUID();
                 socket.emit('intent:resolved', {
                     clientEventId,
@@ -378,8 +399,10 @@ io.on('connection', (socket: Socket) => {
                     sourceId: 'user',
                     targetId: null,
                     traceId,
-                    payload: { objective: text, traceId, originalText: text, intent: 'new_feature' },
+                    payload: { originalText: text, intent: 'new_feature' },
                 });
+                const dialogueAgent = getOrCreateDialogueAgent(traceId);
+                void dialogueAgent.handleUserMessage(text);
             }
         })();
     });
@@ -487,6 +510,11 @@ eventBus.subscribeAll((event: SystemEvent) => {
  * the server or prevents future commands from being processed.
  */
 eventBus.subscribe('USER_COMMAND', (event: SystemEvent) => {
+    // Only spawn ProjectManager for commands from the Dialogue Agent.
+    // USER_COMMAND events from sourceId='user' are chat ledger entries
+    // for replay (user message reconstruction) — not PM triggers.
+    if (event.sourceId === 'user') return;
+
     const traceId = event.traceId ?? event.eventId;
     const objective = typeof event.payload['objective'] === 'string'
         ? event.payload['objective']

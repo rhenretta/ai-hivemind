@@ -7,6 +7,7 @@ import { type ChatMessage } from '@/stores/chatStore';
 import { RelativeTime } from '../shared/RelativeTime';
 
 import { ClarificationCard } from './ClarificationCard';
+import { DialogueBubble } from './DialogueBubble';
 import { FeatureProgressCard } from './FeatureProgressCard';
 import { FeatureProposalCard } from './FeatureProposalCard';
 import { PreviewCard } from './PreviewCard';
@@ -61,6 +62,11 @@ export function AIBubble({ message }: AIBubbleProps) {
                         text={message.text}
                         previewUrl={message.previewUrl}
                     />
+                )}
+
+                {/* Dialogue (conversational response with optional suggestion chips) */}
+                {message.type === 'dialogue' && (
+                    <DialogueBubble message={message} />
                 )}
 
                 <RelativeTime

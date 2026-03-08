@@ -19,7 +19,7 @@ export interface ChatMessage {
     text: string;
     timestamp: string;
     traceId?: string;
-    type: 'text' | 'proposal' | 'progress' | 'clarification' | 'preview';
+    type: 'text' | 'proposal' | 'progress' | 'clarification' | 'preview' | 'dialogue';
     proposal?: FeatureProposal;
     clarification?: ClarificationData;
     previewUrl?: string;
