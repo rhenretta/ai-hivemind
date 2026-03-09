@@ -145,7 +145,7 @@ export class SoftwareEngineer extends BaseAgent {
             traceId: this.traceId,
             agentId: this.agentId,
             content: `[${artifact.success ? 'SUCCESS' : 'FAILED'}] ${this.agentId}\n${JSON.stringify(artifact)}`,
-            tags: ['swe', 'conductor', artifact.success ? 'success' : 'failed'],
+            tags: ['swe', 'conductor', artifact.success ? 'success' : 'failed', 'phase:implement'],
             timestamp: new Date().toISOString(),
         });
     }

@@ -273,8 +273,9 @@ export class ConductorWrapper {
             // Inject ALL user-configured service credentials (ANTHROPIC_API_KEY,
             // OPENAI_API_KEY, etc.) from the credential store. Falls back to
             // process.env for ANTHROPIC_API_KEY if not in the store.
+            // Passes traceId to include session-scoped env vars.
             try {
-                Object.assign(childEnv, credentialStore.getDecryptedEnvVars());
+                Object.assign(childEnv, credentialStore.getDecryptedEnvVars(this.traceId));
             } catch {
                 // Non-fatal — credentials may not be configured
             }
@@ -342,6 +343,172 @@ export class ConductorWrapper {
     }
 
     /**
+     * Ask a question about the codebase via Claude Code running in a sandbox.
+     *
+     * Unlike runTask/runConductorTrack (which are full SWE sessions), this is a
+     * lightweight read-only query. Claude Code explores the codebase using
+     * Read/Glob/Grep tools and returns a text answer. Used by DataResearcher
+     * to gather codebase context during the research phase.
+     *
+     * - 15-minute timeout (deep architectural questions need time)
+     * - --max-turns 15 (enough to explore, not enough to rewrite)
+     * - Read-only constraint in the prompt wrapper
+     * - Returns accumulated assistant text (not void like runTask)
+     */
+    async askQuestion(question: string, sandbox: SandboxHandle): Promise<string> {
+        const wrappedPrompt = [
+            'You are answering a question about this codebase. Use Read, Glob, and Grep tools to explore.',
+            'Do NOT modify any files. Do NOT use Write, Edit, or Bash tools for writes.',
+            'Do NOT use the Agent tool — answer the question yourself directly.',
+            'Be concise but thorough — your answer will be fed into another LLM for planning.',
+            '',
+            `Question: ${question}`,
+        ].join('\n');
+
+        const ASK_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes — deep architectural questions need time
+        const ASK_MAX_TURNS = 15;
+        const MAX_ANSWER_LENGTH = 3072; // 3KB — keeps DataResearcher context manageable
+
+        return new Promise<string>((resolve, reject) => {
+            let settled = false;
+            let answerText = '';
+            let bannerShown = false;
+
+            const timer = setTimeout(() => {
+                if (settled) return;
+                settled = true;
+                proc.kill('SIGTERM');
+                // Return whatever we have so far rather than failing
+                resolve(answerText || `Question timed out after 15 minutes: "${question}"`);
+            }, ASK_TIMEOUT_MS);
+
+            const settle = (text: string) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                resolve(text.length > MAX_ANSWER_LENGTH
+                    ? `${text.slice(0, MAX_ANSWER_LENGTH)}\n[...truncated]`
+                    : text);
+            };
+
+            // Re-inject credentials (may have been refreshed since container creation)
+            injectClaudeCredentials(sandbox.containerName);
+
+            const claudeArgs = [
+                '-p', wrappedPrompt,
+                '--output-format', 'stream-json',
+                '--verbose',
+                '--max-turns', ASK_MAX_TURNS.toString(),
+                '--dangerously-skip-permissions',
+                '--disallowedTools', 'Agent,Write,Edit,NotebookEdit',
+            ];
+
+            // Show the question prompt in the Terminal tab
+            this.stream(`\n── ask_codebase ──────────────────────────────`, 'in', 'input');
+            this.stream(question, 'in', 'input');
+
+            console.log(`[Conductor:${this.agentId}] askQuestion in container=${sandbox.containerName} q="${question.slice(0, 60)}"`);
+            const proc = execInSandbox(sandbox, CLAUDE_BIN, claudeArgs);
+
+            let lineBuffer = '';
+
+            proc.stdout?.on('data', (chunk: Buffer) => {
+                lineBuffer += chunk.toString('utf8');
+                const lines = lineBuffer.split('\n');
+                lineBuffer = lines.pop() ?? '';
+                for (const line of lines) {
+                    const trimmed = line.trim();
+                    if (trimmed.length === 0) continue;
+
+                    let ev: ClaudeEvent;
+                    try {
+                        ev = JSON.parse(trimmed) as ClaudeEvent;
+                    } catch {
+                        continue; // skip non-JSON lines
+                    }
+
+                    if (ev.type === 'system') {
+                        // Only show the banner once per askQuestion call
+                        if (!bannerShown) {
+                            bannerShown = true;
+                            this.stream(`[ask_codebase] Session started (model: ${String((ev as ClaudeSystemEvent).model ?? 'Claude')})`, 'out', 'message');
+                        }
+                    } else if (ev.type === 'assistant') {
+                        const content = ev.message?.content;
+                        if (!Array.isArray(content)) continue;
+                        for (const block of content) {
+                            if (block.type === 'text' && block.text) {
+                                answerText += block.text;
+                                this.stream(block.text, 'out', 'message');
+                            }
+                            if (block.type === 'thinking' && block.thinking) {
+                                this.stream(block.thinking, 'out', 'thought');
+                            }
+                            if (block.type === 'tool_use') {
+                                const inputSummary = JSON.stringify(block.input).slice(0, 120);
+                                this.stream(`[tool: ${block.name}] ${inputSummary}`, 'out', 'tool');
+                                this.emit('TOOL_USED', {
+                                    toolName: block.name,
+                                    input: block.input,
+                                    source: 'conductor:ask_codebase',
+                                });
+                            }
+                        }
+                    } else if (ev.type === 'user') {
+                        const content = ev.message?.content;
+                        if (Array.isArray(content)) {
+                            for (const block of content) {
+                                if (block.type === 'tool_result') {
+                                    const toolOutput = typeof block.content === 'string'
+                                        ? block.content.slice(0, 200)
+                                        : JSON.stringify(block.content).slice(0, 200);
+                                    this.stream(`  → ${toolOutput.replace(/\n/g, ' ').trim().slice(0, 150)}`, 'out', 'tool');
+                                }
+                            }
+                        }
+                    } else if (ev.type === 'result') {
+                        // Use accumulated text, or fall back to result text
+                        const finalText = answerText.trim() || ev.result || 'No answer produced.';
+                        this.stream(`[ask_codebase] Complete (${String(ev.num_turns ?? '?')} turns)`, 'out', 'result');
+                        settle(finalText);
+                    }
+                }
+            });
+
+            proc.stderr?.on('data', (chunk: Buffer) => {
+                const text = chunk.toString('utf8').trim();
+                if (text.length > 0) {
+                    console.warn(`[Conductor:${this.agentId}] askQuestion stderr: ${text.slice(0, 200)}`);
+                }
+            });
+
+            proc.on('exit', (code: number | null) => {
+                // Flush remaining buffer
+                if (lineBuffer.trim().length > 0) {
+                    try {
+                        const ev = JSON.parse(lineBuffer.trim()) as ClaudeEvent;
+                        if (ev.type === 'result') {
+                            settle(answerText.trim() || ev.result || 'No answer produced.');
+                            return;
+                        }
+                    } catch { /* ignore */ }
+                }
+
+                if (!settled) {
+                    settle(answerText.trim() || `Claude Code exited (code ${String(code ?? 'null')}) without a result.`);
+                }
+            });
+
+            proc.on('error', (err: Error) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                reject(err);
+            });
+        });
+    }
+
+    /**
      * Legacy compatibility shim.
      */
     async run(objective: string): Promise<void> {
@@ -356,13 +523,20 @@ export class ConductorWrapper {
      */
     async runConductorTrack(objective: string, _acceptanceCriteria: string, sandbox?: SandboxHandle): Promise<void> {
         const projectRoot = sandbox?.workDir ?? MONOREPO_ROOT;
-        const envContext = [
+
+        // The `objective` already contains a focused, LLM-generated task
+        // briefing with only the relevant context. This method only appends
+        // execution-environment facts (paths, ports, mandatory checks).
+        const envParts: string[] = [
             objective,
             '',
             '## Environment',
             `Project root: ${projectRoot}`,
             'Use ABSOLUTE paths starting with the project root.',
-            ...(sandbox !== undefined ? [
+        ];
+
+        if (sandbox !== undefined) {
+            envParts.push(
                 `You are inside an isolated Docker sandbox. Source at ${sandbox.workDir}.`,
                 'Dependencies are pre-installed. Changes merge back after QA.',
                 'IMPORTANT: Clear stale Next.js cache before building: rm -rf apps/web/.next',
@@ -372,49 +546,33 @@ export class ConductorWrapper {
                 `The frontend (Next.js) reads WEB_PORT from env and starts on port ${sandbox.webPort.toString()}: just run \`pnpm --filter @ai-hivemind/web dev\` (no -p flag needed).`,
                 `The Next.js rewrites proxy is configured via BACKEND_PORT env var to forward /api/* to the backend on port ${sandbox.backendPort.toString()}.`,
                 'These are the ONLY ports available — do NOT use 3000 or 3001.',
-            ] : []),
+            );
+        }
+
+        envParts.push(
             '',
             '## API Architecture',
             'The Next.js frontend proxies /api/* requests to the Express backend via rewrites in next.config.ts.',
             'In frontend code, ALWAYS use relative paths for API calls: `fetch("/api/posts")`, `fetch("/api/weather")`.',
             'NEVER hardcode any port number in frontend code — the proxy handles routing to the backend.',
             '',
-            '## Using Available Services',
-            'When your task involves content analysis, classification, semantic filtering,',
-            'data enrichment, or any task that requires understanding meaning:',
-            '- Use the available external services listed in your objective (e.g., OpenAI for classification, Brave for search)',
-            '- Do NOT build keyword lists, regex patterns, or hardcoded rules as a substitute',
-            '  for proper API-based solutions when an appropriate service is available',
-            '- A 10-line API call to a classification service is better than a 100-line',
-            '  hardcoded heuristic — it is more accurate, more maintainable, and handles edge cases',
+            '## MANDATORY: Verify your work',
+            '1. Test end-to-end: start the dev server, curl endpoints or load pages to confirm they work with real data.',
+            '2. Debug properly: when something fails, read the actual error — do not guess or mask with retries.',
+            '3. Run `pnpm build` and confirm it succeeds BEFORE you finish. QA will reject a broken build.',
             '',
-            '## MANDATORY: Debug properly — never guess',
-            'When something does not work (API calls fail, endpoints return errors, data is missing):',
-            '1. **Read the actual response** — `curl -v <url>` to see status code, headers, and body',
-            '2. **Check logs** — look at terminal output, stderr, and server logs for error messages',
-            '3. **Test in isolation** — run a minimal reproduction to confirm the root cause',
-            '4. **Fix the root cause** — do NOT just adjust timeouts, retries, or error handling to mask the problem',
-            '',
-            'Common pitfalls to avoid:',
-            '- If an API returns 403/429, read the error body — it usually tells you exactly what is wrong (missing User-Agent, auth, rate limit)',
-            '- If a fetch times out, that is a symptom, not the cause — find out WHY it times out before changing timeout values',
-            '- If data is empty, verify the request URL, headers, and query params are correct before adding fallback logic',
-            '- Graceful degradation is good, but only AFTER you have tried to make the happy path actually work',
-            '',
-            '## MANDATORY: Test your work end-to-end',
-            'Before finishing, you MUST verify the feature actually works:',
-            '- Start the dev server if not already running',
-            '- `curl` your API endpoints and confirm they return real data (not empty arrays or fallback responses)',
-            '- If the endpoint depends on an external API, verify the external call works (correct URL, headers, auth)',
-            '- If the feature has a frontend page, curl the page URL to ensure it compiles and serves',
-            '',
-            '## MANDATORY: Verify build before finishing',
-            'You MUST run `pnpm build` and confirm it succeeds BEFORE you consider your task done.',
-            'If the build fails, fix the errors and rebuild until it passes.',
-            'Do NOT finish with a broken build — QA will reject it.',
-        ].join('\n');
+            '## MANDATORY: Document your API surface',
+            'At the END of your work (after build passes), print a section exactly like this so QA knows what to test:',
+            '```',
+            '## Endpoints Created/Modified',
+            '- METHOD /path — description (request body: {...}, response: {...})',
+            '- METHOD /path — description (request body: {...}, response: {...})',
+            '```',
+            'List EVERY endpoint you created or modified with its HTTP method, path, and request/response shape.',
+            'QA will test exactly these endpoints — if you omit one, it won\'t be tested. If you list a wrong path, QA will fail.',
+        );
 
-        return this.runTask(envContext, sandbox);
+        return this.runTask(envParts.join('\n'), sandbox);
     }
 
     /**
@@ -532,7 +690,7 @@ export class ConductorWrapper {
             childEnv['DISABLE_AUTOUPDATER'] = '1';
             childEnv['CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL'] = '1';
             try {
-                Object.assign(childEnv, credentialStore.getDecryptedEnvVars());
+                Object.assign(childEnv, credentialStore.getDecryptedEnvVars(this.traceId));
             } catch { /* Non-fatal */ }
             if (childEnv['ANTHROPIC_API_KEY'] === undefined && process.env['ANTHROPIC_API_KEY']) {
                 childEnv['ANTHROPIC_API_KEY'] = process.env['ANTHROPIC_API_KEY'];

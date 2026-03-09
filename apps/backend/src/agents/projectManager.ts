@@ -1,15 +1,17 @@
 /**
  * projectManager.ts — Project Manager Agent (RPIV Pipeline)
  *
- * The single entry point for all feature work. Runs the full pipeline:
+ * @deprecated — The DialogueAgent now owns the task graph directly and spawns
+ * FeatureDeveloper for execution. This file is kept for reference but is no
+ * longer instantiated by server.ts. See:
+ *   - dialogueAgent.ts — task graph ownership, agent orchestration
+ *   - featureDeveloper.ts — execution engine (ported from this file)
  *
+ * Old pipeline (no longer used):
  *   1. RESEARCH   — DataResearcher gathers codebase context
  *   2. DESIGN     — UxDesigner produces a UX design spec
  *   3. DECOMPOSE  — LLM decides: atomic (single task) or composite (DAG)
  *   4. EXECUTE    — Process nodes sequentially via Claude Code CLI + QA
- *
- * Previously this was split across three agents (Coordinator → ProjectManager
- * → TaskOrchestrator). Now it's a single agent that owns the full lifecycle.
  */
 
 import { execSync } from 'node:child_process';
@@ -24,7 +26,7 @@ import { credentialStore } from '../services/credentialStore.js';
 import { ragStore } from '../services/ragStore.js';
 import { ConductorWrapper } from '../services/conductor.js';
 import { createFeatureSandbox, type SandboxHandle } from '../services/sandboxManager.js';
-import { saveState, clearState } from '../services/taskStateStore.js';
+import { saveState, clearState, loadPendingState, type AttemptRecord } from '../services/taskStateStore.js';
 import { BaseAgent } from './baseAgent.js';
 import { DataResearcher } from './dataResearcher.js';
 import { SiteExplorer } from './siteExplorer.js';
@@ -49,13 +51,34 @@ import {
 } from '@ai-hivemind/shared';
 import type { SweArtifact } from '@ai-hivemind/shared';
 import type { SystemEvent } from '@ai-hivemind/shared';
+import { QaArbiterDecisionSchema, type QaArbiterDecision } from '@ai-hivemind/shared';
 
+import { contextAgent } from '../services/contextAgent.js';
 import { getDialogueAgent } from '../services/dialogueAgent.js';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const MAX_RETRIES = 2;
+const MAX_ARBITER_ROUNDS = 5; // safety cap — after this many attempts, force ask_user
 const MAX_NODES = 8; // safety cap on decomposition depth
+const MAX_PM_DEPTH = 3; // cap on recursive PM hierarchy depth
+
+// ── Sub-PM Context ───────────────────────────────────────────────────────────
+
+/** Context passed from a parent PM to a sub-PM for delegated execution. */
+export interface SubPmContext {
+    /** Research summary inherited from parent — skip re-research */
+    researchSummary: string;
+    /** UX design spec inherited from parent — skip re-design */
+    designSpec: UxDesignSpec | null;
+    /** Shared sandbox handle (same Docker container for entire feature) */
+    sandbox: SandboxHandle;
+    /** Current nesting depth (root = 0) */
+    depth: number;
+    /** The specific task node this sub-PM is responsible for */
+    assignedNode: TaskNode;
+    /** Summary of completed sibling tasks and their changes */
+    siblingContext: string;
+}
 
 // ── Decomposer prompt ─────────────────────────────────────────────────────────
 
@@ -63,7 +86,7 @@ function hasDesignSpec(spec: UxDesignSpec | null): boolean {
     return spec !== null && spec.layout !== '';
 }
 
-function buildDecomposerPrompt(objective: string, researchSummary: string, designSpec: UxDesignSpec | null): string {
+function buildDecomposerPrompt(objective: string, researchSummary: string, designSpec: UxDesignSpec | null, depth = 0, siblingContext = ''): string {
     const hasDesign = hasDesignSpec(designSpec);
     const designSection = hasDesign
         ? `
@@ -126,14 +149,16 @@ COMPOSITE case (max ${MAX_NODES.toString()} nodes):
       "objective": "<self-contained description>",
       "acceptanceCriteria": "<specific criteria>",
       "taskType": "backend",
-      "dependsOn": []
+      "dependsOn": [],
+      "delegatable": false
     },
     {
       "id": "task-2",
       "objective": "<self-contained description — include context from task-1>",
       "acceptanceCriteria": "<specific criteria>",
       "taskType": "frontend",
-      "dependsOn": ["task-1"]
+      "dependsOn": ["task-1"],
+      "delegatable": true
     }
   ]
 }
@@ -162,22 +187,50 @@ Rules:
 - NAVIGATION RULE: When a task creates a new page or route, there MUST be a task (or acceptance
   criterion within a task) that adds a navigation link from existing pages to the new page.
   Users must be able to discover and reach the new feature from the main site. Check the design
-  spec's Navigation field for where the link should go. A new page with no entry point is a blocker.`;
+  spec's Navigation field for where the link should go. A new page with no entry point is a blocker.
+- "delegatable": set to true if the node is complex enough to warrant its own sub-project-manager.
+  A node is delegatable when:
+  - It involves multiple distinct sub-phases (e.g. "build auth system" = schema + middleware + routes + UI)
+  - It touches 3+ files across different areas of the codebase
+  - It could reasonably be decomposed into 2+ sequential sub-tasks
+  Set to false for focused changes (one component, one API route, one config).${depth >= MAX_PM_DEPTH - 1 ? '\n  NOTE: Maximum delegation depth reached — set ALL nodes to "delegatable": false.' : ''}${siblingContext !== '' ? `
+
+SIBLING TASK CONTEXT — These tasks are being handled by OTHER project managers in the same hierarchy.
+Do NOT duplicate any work described below. Your decomposition must ONLY cover the objective above.
+If a sibling already handles frontend, do NOT add frontend tasks. If a sibling handles backend, do NOT add backend tasks.
+${siblingContext}` : ''}`;
 }
 
 // ── Main class ────────────────────────────────────────────────────────────────
 
 export class ProjectManager extends BaseAgent {
-    constructor(agentId: string, traceId: string) {
-        super(agentId, traceId);
+    /** If non-null, this PM is a sub-PM spawned for a specific node. */
+    readonly #subPmContext: SubPmContext | null;
+
+    constructor(
+        agentId: string,
+        traceId: string,
+        parentAgentId: string | null = null,
+        subPmContext: SubPmContext | null = null,
+    ) {
+        super(agentId, traceId, parentAgentId);
+        this.#subPmContext = subPmContext;
     }
 
     /**
      * Run the full RPIV pipeline for an objective.
+     * If this is a sub-PM (has SubPmContext), skips Research/Explore/Design
+     * and goes straight to Decompose+Execute.
      * Returns a final summary string.
      */
     async run(objective: string): Promise<string> {
         this.spawn('project-manager');
+
+        // Sub-PM path: skip Research/Explore/Design, go to Decompose+Execute
+        if (this.#subPmContext !== null) {
+            return this._runAsSubPm(objective);
+        }
+
         this.emit('STATE_CHANGED', { message: `Starting: "${objective}"`, phase: 'start' });
 
         // ── Enrich objective with monorepo context ────────────────────────────
@@ -195,6 +248,8 @@ export class ProjectManager extends BaseAgent {
         } catch (err) {
             logger.warn(`[${this.agentId}] Research failed (non-fatal):`, err);
         }
+        // Share research summary with Context Agent for dialogue enrichment
+        contextAgent.setResearchSummary(this.traceId, researchSummary);
 
         // ── EXPLORE ───────────────────────────────────────────────────────────
         // Site Explorer browses the live frontend to understand current state.
@@ -220,6 +275,8 @@ export class ProjectManager extends BaseAgent {
         try {
             designSpec = await designer.run(enrichedObjective, researchSummary, siteExploration);
             logger.info(`[${this.agentId}] UX design complete: ${designSpec.layout.slice(0, 100)}`);
+            // Share design spec with Context Agent for dialogue enrichment
+            contextAgent.setDesignSpec(this.traceId, designSpec);
         } catch (err) {
             logger.warn(`[${this.agentId}] Design phase failed (non-fatal):`, err);
         }
@@ -239,10 +296,11 @@ export class ProjectManager extends BaseAgent {
         // Emit the initial graph — UI shows the plan
         this.#emitGraph(graph, 'Task graph created');
 
-        // Register graph with Dialogue Agent so it has context for conversation
+        // Register graph with Dialogue Agent so it has context for conversation.
+        // Pass our agentId so mutations are targeted back to us (not sub-PMs).
         const dialogueAgent = getDialogueAgent(this.traceId);
         if (dialogueAgent !== undefined) {
-            dialogueAgent.setTaskGraph(graph);
+            dialogueAgent.setTaskGraph(graph, this.agentId);
         }
 
         // ── EXECUTE ───────────────────────────────────────────────────────────
@@ -254,6 +312,73 @@ export class ProjectManager extends BaseAgent {
             dialogueAgent.onExecutionComplete(result);
         }
 
+        return result.summary;
+    }
+
+    // ── Sub-PM execution ─────────────────────────────────────────────────────
+
+    /**
+     * Sub-PM path: inherits research and design from parent, goes straight to
+     * Decompose+Execute for the assigned node's objective.
+     */
+    private async _runAsSubPm(objective: string): Promise<string> {
+        const ctx = this.#subPmContext!;
+        const depth = ctx.depth;
+
+        this.emit('STATE_CHANGED', {
+            message: `Sub-PM starting: "${objective}"`,
+            phase: 'start',
+            depth,
+            parentNodeId: ctx.assignedNode.id,
+        });
+
+        // At max depth, force atomic execution — no further decomposition
+        if (depth >= MAX_PM_DEPTH) {
+            logger.info(`[${this.agentId}] At max depth (${depth.toString()}), executing directly`);
+            const nodeResult = await this.#executeNode(
+                ctx.assignedNode, ctx.researchSummary, ctx.sandbox, ctx.designSpec,
+            );
+            this.terminate(nodeResult.success ? 'task_complete' : 'task_failed');
+            return nodeResult.summary;
+        }
+
+        // Decompose: does this node need further breakdown?
+        const enrichedObjective = this.#enrichObjective(objective);
+        let graph: TaskGraph;
+        try {
+            graph = await this.#decompose(enrichedObjective, ctx.researchSummary, ctx.designSpec, depth, ctx.siblingContext);
+            graph.ownerAgentId = this.agentId;
+            graph.depth = depth;
+            graph.parentNodeId = ctx.assignedNode.id;
+        } catch (err) {
+            // Decomposition failed — fall back to direct execution
+            logger.warn(`[${this.agentId}] Sub-PM decomposition failed, executing directly:`, err);
+            const nodeResult = await this.#executeNode(
+                ctx.assignedNode, ctx.researchSummary, ctx.sandbox, ctx.designSpec,
+            );
+            this.terminate(nodeResult.success ? 'task_complete' : 'task_failed');
+            return nodeResult.summary;
+        }
+
+        // If decomposer says atomic (single node), execute directly
+        if (graph.nodes.length <= 1) {
+            logger.info(`[${this.agentId}] Sub-PM decomposed to single node, executing directly`);
+            const singleNode = graph.nodes[0] ?? ctx.assignedNode;
+            const nodeResult = await this.#executeNode(
+                singleNode, ctx.researchSummary, ctx.sandbox, ctx.designSpec,
+            );
+            this.terminate(nodeResult.success ? 'task_complete' : 'task_failed');
+            return nodeResult.summary;
+        }
+
+        // Composite — emit sub-graph and execute via sub-PMs or direct
+        this.#emitGraph(graph, `Sub-PM decomposed into ${graph.nodes.length.toString()} tasks`);
+
+        // Attach sub-graph to the assigned node (parent graph picks this up)
+        ctx.assignedNode.subGraph = graph;
+
+        const result = await this.#executeGraph(graph, ctx.researchSummary, ctx.designSpec, ctx.sandbox, depth);
+        this.terminate(result.success ? 'task_complete' : 'task_failed');
         return result.summary;
     }
 
@@ -297,8 +422,8 @@ export class ProjectManager extends BaseAgent {
 
     // ── Private — decompose ───────────────────────────────────────────────────
 
-    async #decompose(objective: string, researchSummary: string, designSpec: UxDesignSpec | null = null): Promise<TaskGraph> {
-        const prompt = buildDecomposerPrompt(objective, researchSummary, designSpec);
+    async #decompose(objective: string, researchSummary: string, designSpec: UxDesignSpec | null = null, depth = 0, siblingContext = ''): Promise<TaskGraph> {
+        const prompt = buildDecomposerPrompt(objective, researchSummary, designSpec, depth, siblingContext);
         const completion = await generateWithRawTools(
             [
                 { role: 'system', content: prompt },
@@ -313,7 +438,14 @@ export class ProjectManager extends BaseAgent {
 
         type DecomposerResponse = {
             isAtomic: boolean;
-            nodes: Array<{ id: string; objective: string; acceptanceCriteria: string; taskType?: string; dependsOn: string[] }>;
+            nodes: Array<{
+                id: string;
+                objective: string;
+                acceptanceCriteria: string;
+                taskType?: string;
+                dependsOn: string[];
+                delegatable?: boolean;
+            }>;
         };
         const parsed = JSON.parse(json) as DecomposerResponse;
 
@@ -332,6 +464,8 @@ export class ProjectManager extends BaseAgent {
             taskType: (typeof n.taskType === 'string' && validTypes.has(n.taskType)
                 ? n.taskType
                 : 'fullstack') as TaskNode['taskType'],
+            // Only mark delegatable if we haven't hit max depth
+            delegatable: depth < MAX_PM_DEPTH - 1 && n.delegatable === true,
         }));
 
         return {
@@ -344,14 +478,19 @@ export class ProjectManager extends BaseAgent {
 
     // ── Private — execute ─────────────────────────────────────────────────────
 
-    async #executeGraph(graph: TaskGraph, researchSummary: string, initialDesignSpec: UxDesignSpec | null = null): Promise<{ success: boolean; summary: string }> {
+    async #executeGraph(
+        graph: TaskGraph,
+        researchSummary: string,
+        initialDesignSpec: UxDesignSpec | null = null,
+        existingSandbox?: SandboxHandle,
+        depth = 0,
+    ): Promise<{ success: boolean; summary: string }> {
         let designSpec = initialDesignSpec;
         const completedSummaries: string[] = [];
 
         // ── Feature sandbox ───────────────────────────────────────────────────
-        // Create (or reuse) the per-feature sandbox keyed on this.traceId.
-        // All Conductor sub-tasks share it.
-        const sandbox = await createFeatureSandbox(this.traceId);
+        // Root PMs create a sandbox; sub-PMs reuse the parent's sandbox.
+        const sandbox = existingSandbox ?? await createFeatureSandbox(this.traceId);
         logger.info(`[${this.agentId}] Using feature sandbox container: ${sandbox.containerName}`);
 
         // ── Subscribe to plan mutations from the Dialogue Agent ──────────────
@@ -363,6 +502,15 @@ export class ProjectManager extends BaseAgent {
         const pendingMutations: PlanMutation[] = [];
         const unsubMutations = eventBus.subscribe('DIALOGUE_UPDATE_PLAN', (event: SystemEvent) => {
             if (event.traceId !== this.traceId) return;
+
+            // Only accept mutations targeted at this PM (or untargeted for backward compat).
+            // This prevents sub-PMs from consuming mutations intended for the root PM's graph.
+            const targetAgent = event.payload['targetAgentId'] as string | undefined;
+            if (targetAgent !== undefined && targetAgent !== this.agentId) {
+                logger.info(`[${this.agentId}] Ignoring plan mutation targeted at ${targetAgent}`);
+                return;
+            }
+
             pendingMutations.push({
                 newNodes: (event.payload['newNodes'] as PlanMutation['newNodes']) ?? [],
                 updatedNodes: (event.payload['updatedNodes'] as PlanMutation['updatedNodes']) ?? [],
@@ -377,12 +525,31 @@ export class ProjectManager extends BaseAgent {
             madeProgress = false;
 
             // ── Apply queued plan mutations ──────────────────────────────────
-            while (pendingMutations.length > 0) {
-                const mutation = pendingMutations.shift()!;
+            // Coalesce first: if multiple mutations target the same node, keep
+            // only the latest version. This prevents redundant/conflicting
+            // updates when the user sends several messages in quick succession.
+            if (pendingMutations.length > 0) {
+                const coalescedNewNodes = new Map<string, PlanMutation['newNodes'][number]>();
+                const coalescedUpdates = new Map<string, PlanMutation['updatedNodes'][number]>();
+
+                while (pendingMutations.length > 0) {
+                    const mutation = pendingMutations.shift()!;
+                    for (const n of mutation.newNodes) {
+                        coalescedNewNodes.set(n.id, n); // last-write-wins
+                    }
+                    for (const u of mutation.updatedNodes) {
+                        coalescedUpdates.set(u.nodeId, u); // last-write-wins
+                    }
+                }
+
+                const mergedNewNodes = [...coalescedNewNodes.values()];
+                const mergedUpdates = [...coalescedUpdates.values()];
+                logger.info(`[${this.agentId}] Coalesced mutations: ${mergedNewNodes.length.toString()} new, ${mergedUpdates.length.toString()} updates`);
+
                 try {
                     // Add new nodes
-                    if (mutation.newNodes.length > 0) {
-                        const newTaskNodes: TaskNode[] = mutation.newNodes.map((n) => ({
+                    if (mergedNewNodes.length > 0) {
+                        const newTaskNodes: TaskNode[] = mergedNewNodes.map((n) => ({
                             id: n.id,
                             objective: n.objective,
                             acceptanceCriteria: n.acceptanceCriteria,
@@ -395,7 +562,7 @@ export class ProjectManager extends BaseAgent {
                         logger.info(`[${this.agentId}] Appended ${newTaskNodes.length.toString()} new nodes`);
                     }
                     // Update pending nodes
-                    for (const update of mutation.updatedNodes) {
+                    for (const update of mergedUpdates) {
                         const patch: { objective?: string; acceptanceCriteria?: string } = {};
                         if (update.objective !== undefined) patch.objective = update.objective;
                         if (update.acceptanceCriteria !== undefined) patch.acceptanceCriteria = update.acceptanceCriteria;
@@ -438,20 +605,103 @@ export class ProjectManager extends BaseAgent {
                 (n: TaskNode) => n.status === 'pending' && dependenciesMet(n, graph),
             );
 
-            if (nextNode === undefined) break;
+            if (nextNode === undefined) {
+                // Check for blocked nodes waiting on user input
+                const blockedNode = graph.nodes.find(
+                    (n: TaskNode) => n.status === 'blocked',
+                );
+                if (blockedNode === undefined) break;
 
-            // Execute this node
+                // Wait for user response before resuming
+                const userResponse = await this.#waitForUserInput(blockedNode.id);
+                if (userResponse === null) break; // timeout or cancelled
+
+                logger.info(`[${this.agentId}] Resuming blocked node [${blockedNode.id}] with user response`);
+                blockedNode.status = 'active';
+                delete blockedNode.error;
+                graph.status = 'active';
+                this.#emitGraph(graph, `Resuming [${blockedNode.id}] with your input`);
+
+                const resumeResult = await this.#executeNode(blockedNode, researchSummary, sandbox, designSpec, graph, userResponse);
+
+                madeProgress = true;
+                if (resumeResult.success) {
+                    blockedNode.status = 'done';
+                    blockedNode.result = resumeResult.summary;
+                    completedSummaries.push(`[${blockedNode.id}] ✓ ${resumeResult.summary}`);
+                } else if ('blocked' in resumeResult && resumeResult['blocked'] === true) {
+                    blockedNode.status = 'blocked';
+                    blockedNode.error = resumeResult.summary;
+                } else {
+                    blockedNode.status = 'failed';
+                    blockedNode.error = resumeResult.summary;
+                }
+
+                graph.status = deriveGraphStatus(graph);
+                this.#emitNodeCompleted(graph, blockedNode);
+                this.#emitGraph(graph, `[${blockedNode.id}] ${blockedNode.status}`);
+                continue;
+            }
+
+            // Execute this node — delegate to sub-PM if complex, otherwise run directly
             nextNode.status = 'active';
             graph.status = 'active';
-            this.#emitGraph(graph, `Executing [${nextNode.id}]: ${nextNode.objective}`);
 
-            const nodeResult = await this.#executeNode(nextNode, researchSummary, sandbox, designSpec, graph);
+            let nodeResult: { success: boolean; summary: string };
+
+            if (nextNode.delegatable === true && depth < MAX_PM_DEPTH) {
+                // ── Delegate to sub-PM ────────────────────────────────────────
+                const childPmId = `project-manager.${uuidv4().slice(0, 8)}`;
+                nextNode.delegatedTo = childPmId;
+                this.#emitGraph(graph, `Delegating [${nextNode.id}] to sub-PM ${childPmId}`);
+
+                const childContext: SubPmContext = {
+                    researchSummary,
+                    designSpec,
+                    sandbox,
+                    depth: depth + 1,
+                    assignedNode: nextNode,
+                    siblingContext: this._buildSiblingContext(graph, completedSummaries),
+                };
+
+                const childPm = new ProjectManager(
+                    childPmId, this.traceId, this.agentId, childContext,
+                );
+
+                // Subscribe to sub-PM graph updates so we re-emit the full hierarchy.
+                // The sub-PM writes to nextNode.subGraph by reference, so our graph
+                // object always has the latest nested state — we just re-emit it.
+                const unsubChildGraph = eventBus.subscribe('TASK_GRAPH_UPDATED', (evt: SystemEvent) => {
+                    if (evt.sourceId === childPmId) {
+                        this.#emitGraph(graph, `[${nextNode.id}] sub-PM progress`);
+                    }
+                });
+
+                try {
+                    const summary = await childPm.run(nextNode.objective);
+                    nodeResult = { success: true, summary };
+                } catch (err) {
+                    const msg = err instanceof Error ? err.message : String(err);
+                    nodeResult = { success: false, summary: msg };
+                } finally {
+                    unsubChildGraph();
+                }
+            } else {
+                // ── Execute directly via SWE+QA ──────────────────────────────
+                this.#emitGraph(graph, `Executing [${nextNode.id}]: ${nextNode.objective}`);
+                nodeResult = await this.#executeNode(nextNode, researchSummary, sandbox, designSpec, graph);
+            }
+
             madeProgress = true;
 
             if (nodeResult.success) {
                 nextNode.status = 'done';
                 nextNode.result = nodeResult.summary;
                 completedSummaries.push(`[${nextNode.id}] ✓ ${nodeResult.summary}`);
+            } else if ('blocked' in nodeResult && nodeResult['blocked'] === true) {
+                // Arbiter escalated to user — keep blocked status (already set inside #executeNode)
+                nextNode.status = 'blocked';
+                nextNode.error = nodeResult.summary;
             } else {
                 nextNode.status = 'failed';
                 nextNode.error = nodeResult.summary;
@@ -460,13 +710,33 @@ export class ProjectManager extends BaseAgent {
             graph.status = deriveGraphStatus(graph);
             this.#emitNodeCompleted(graph, nextNode);
             this.#emitGraph(graph, `[${nextNode.id}] ${nextNode.status}`);
+
+            // Send proactive progress update via DialogueAgent (root PM only)
+            if (this.parentAgentId === null) {
+                const da = getDialogueAgent(this.traceId);
+                if (da !== undefined) {
+                    const done = graph.nodes.filter((n: TaskNode) => n.status === 'done' || n.status === 'skipped').length;
+                    da.onNodeCompleted(
+                        { id: nextNode.id, objective: nextNode.objective, status: nextNode.status },
+                        { done, total: graph.nodes.length },
+                    );
+                }
+            }
         }
 
         // Clean up mutation subscription
         unsubMutations();
 
+        const blockedNodes = graph.nodes.filter((n: TaskNode) => n.status === 'blocked');
         const allDoneOrSkipped = graph.nodes.every((n: TaskNode) => n.status === 'done' || n.status === 'skipped');
         const failedNodes = graph.nodes.filter((n: TaskNode) => n.status === 'failed');
+
+        // If any nodes are blocked, report that status (not failure)
+        if (blockedNodes.length > 0 && failedNodes.length === 0) {
+            const blockedMsg = blockedNodes.map((n) => `[${n.id}]: ${n.error ?? 'waiting for input'}`).join('; ');
+            this.emit('STATE_CHANGED', { message: `Blocked: ${blockedMsg}`, phase: 'implement' });
+            return { success: false, summary: `Blocked tasks: ${blockedMsg}` };
+        }
 
         if (allDoneOrSkipped && failedNodes.length === 0) {
             // Sandbox stays alive for preview — merge happens when user clicks "Deploy"
@@ -577,6 +847,8 @@ Guidelines:
                 const updatedObjective = `${graph.rootObjective}\n\nUpdated pending tasks:\n${pendingSummary}`;
                 const newSpec = await refreshDesigner.run(updatedObjective, researchSummary);
                 setDesignSpec(newSpec);
+                // Update context agent with refreshed design
+                contextAgent.setDesignSpec(this.traceId, newSpec);
                 logger.info(`[${this.agentId}] UX design refreshed after mutation`);
             } catch (err) {
                 logger.warn(`[${this.agentId}] UX design refresh failed (non-fatal):`, err);
@@ -588,17 +860,35 @@ Guidelines:
         }
     }
 
-    async #executeNode(node: TaskNode, researchSummary: string, sandbox: SandboxHandle, designSpec: UxDesignSpec | null = null, graph?: TaskGraph): Promise<{ success: boolean; summary: string }> {
+    async #executeNode(node: TaskNode, researchSummary: string, sandbox: SandboxHandle, designSpec: UxDesignSpec | null = null, graph?: TaskGraph, userResponse?: string): Promise<{ success: boolean; summary: string; blocked?: boolean; userQuestion?: string }> {
         this.emit('STATE_CHANGED', {
-            message: `Starting node [${node.id}]: ${node.objective}`,
+            message: userResponse !== undefined
+                ? `Resuming node [${node.id}] with your input`
+                : `Starting node [${node.id}]: ${node.objective}`,
             phase: 'implement',
             nodeId: node.id,
         });
 
         let passed = false;
-        let priorIssues: string[] = [];
         let lastAttemptCrashed = false;
         let finalSummary = '';
+
+        // Restore state from persisted checkpoint when resuming a blocked node
+        const resumeState = userResponse !== undefined ? loadPendingState() : null;
+        let priorIssues: string[] = resumeState?.priorIssues ?? [];
+        let arbiterSweFeedback: string | undefined = userResponse !== undefined
+            ? `The user responded to your question with the following guidance:\n\n${userResponse}\n\nIncorporate this feedback and fix the remaining issues.`
+            : undefined;
+        let arbiterQaGuidance: string | undefined = resumeState?.arbiterGuidance?.qaGuidance;
+        let activeCriteria = resumeState?.arbiterGuidance?.updatedAcceptanceCriteria ?? node.acceptanceCriteria;
+        const attemptHistory: AttemptRecord[] = resumeState?.attemptHistory ?? [];
+        let attempt = resumeState?.attempt ?? 0;
+
+        // Clear the persisted blocked state now that we're resuming
+        if (resumeState !== null) {
+            clearState();
+            logger.info(`[${this.agentId}] Resuming node [${node.id}] from attempt ${attempt.toString()} with ${attemptHistory.length.toString()} prior attempts`);
+        }
 
         const sweId = `swe-agent.${uuidv4().slice(0, 8)}`;
 
@@ -615,11 +905,15 @@ Guidelines:
         const conductorRef = new ConductorWrapper(sweId, this.traceId);
 
         try {
-            for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+            while (!passed && attempt < MAX_ARBITER_ROUNDS) {
                 node.attempts = attempt + 1;
 
-                // Build the enriched prompt for this attempt
-                const sweObjective = this.#buildSweObjective(node, researchSummary, priorIssues, attempt, designSpec);
+                // Build the enriched prompt for this attempt (LLM selects relevant context)
+                // On retries, use arbiter's refined feedback instead of raw QA issues
+                const retryIssues = arbiterSweFeedback !== undefined
+                    ? [arbiterSweFeedback]
+                    : priorIssues;
+                const sweObjective = await this.#buildSweObjective(node, researchSummary, retryIssues, attempt, designSpec);
 
                 // Emit with the FULL objective — this is what Claude Code actually receives.
                 // The activity log shows the short message; raw JSON reveals the full prompt.
@@ -628,7 +922,7 @@ Guidelines:
                         ? node.objective
                         : lastAttemptCrashed
                             ? `Retry ${attempt.toString()}: resuming after crash`
-                            : `Retry ${attempt.toString()}: fixing ${priorIssues.length.toString()} QA issue(s)`,
+                            : `Retry ${attempt.toString()}: fixing QA issue(s)`,
                     phase: 'implement',
                     objective: sweObjective,
                     attempt,
@@ -640,11 +934,18 @@ Guidelines:
                     nodeId: node.id,
                     sweId,
                     objective: node.objective,
-                    acceptanceCriteria: node.acceptanceCriteria,
+                    acceptanceCriteria: activeCriteria,
                     phase: 'conductor',
                     attempt,
                     filesChanged: [],
                     priorIssues,
+                    attemptHistory,
+                    ...(arbiterQaGuidance !== undefined ? {
+                        arbiterGuidance: {
+                            qaGuidance: arbiterQaGuidance,
+                            ...(activeCriteria !== node.acceptanceCriteria ? { updatedAcceptanceCriteria: activeCriteria } : {}),
+                        },
+                    } : {}),
                     conductorSummary: '',
                     savedAt: new Date().toISOString(),
                 });
@@ -700,11 +1001,12 @@ Guidelines:
                         lastAttemptCrashed = false;
                         await conductor.resumeWithFollowup(crashRetryPrompt, sandbox);
                     } else {
-                        // Retry after QA failure: resume with QA feedback.
+                        // Retry after QA failure: use arbiter-refined feedback if available.
+                        const feedback = arbiterSweFeedback ?? priorIssues.join('\n- ');
                         const retryPrompt = [
-                            `## QA Found ${priorIssues.length.toString()} Issue(s) — Fix Them`,
+                            '## QA Feedback — Action Required',
                             '',
-                            ...priorIssues.map((issue) => `- ${issue}`),
+                            feedback,
                             '',
                             'Fix these issues in your existing code. Do NOT start over.',
                             'After fixing, run `pnpm build` to verify it compiles.',
@@ -728,11 +1030,12 @@ Guidelines:
                         nodeId: node.id,
                         sweId,
                         objective: node.objective,
-                        acceptanceCriteria: node.acceptanceCriteria,
+                        acceptanceCriteria: activeCriteria,
                         phase: 'awaiting-qa',
                         attempt,
                         filesChanged: artifact.filesChanged,
                         priorIssues,
+                        attemptHistory,
                         ...(deployedServiceUrl !== undefined ? { serviceUrl: deployedServiceUrl } : {}),
                         conductorSummary: artifact.summary,
                         savedAt: new Date().toISOString(),
@@ -765,13 +1068,11 @@ Guidelines:
                 // Skip QA if the conductor itself crashed — go straight to retry
                 if (conductorCrashed) {
                     logger.warn(`[${this.agentId}] Skipping QA for crashed attempt ${(attempt + 1).toString()}, will retry`);
+                    attempt++;
                     continue;
                 }
 
                 // ── RESTART DEV SERVERS ──────────────────────────────────────
-                // SWE code changes often crash/corrupt the running dev servers
-                // (hot-reload failures, 500s after recompile). Kill and restart
-                // them cleanly before QA probes anything.
                 if (sandbox !== undefined) {
                     await this.#restartSandboxServers(artifact, sandbox);
                 }
@@ -779,7 +1080,24 @@ Guidelines:
                 // ── VALIDATE ─────────────────────────────────────────────────
                 const qaId = `qa-engineer.${uuidv4().slice(0, 8)}`;
                 const qa = new QaEngineer(qaId, this.traceId);
-                const verdict = await qa.run(node.objective, node.acceptanceCriteria, artifact, deployedServiceUrl, sandbox, designSpec, graph, priorIssues.length > 0 ? priorIssues : undefined);
+                const verdict = await qa.run(
+                    node.objective, activeCriteria, artifact,
+                    deployedServiceUrl, sandbox, designSpec, graph,
+                    priorIssues.length > 0 ? priorIssues : undefined,
+                    arbiterQaGuidance,
+                );
+
+                // Record this attempt for the arbiter's history
+                attemptHistory.push({
+                    attempt,
+                    sweSummary: artifact.summary,
+                    qaVerdict: {
+                        passed: verdict.passed,
+                        issues: verdict.issues,
+                        warnings: verdict.warnings,
+                        ...(verdict.summary !== undefined ? { summary: verdict.summary } : {}),
+                    },
+                });
 
                 if (verdict.passed) {
                     passed = true;
@@ -788,8 +1106,124 @@ Guidelines:
                     break;
                 }
 
-                priorIssues = verdict.issues;
-                logger.warn(`[${this.agentId}] Node [${node.id}] QA failed (attempt ${(attempt + 1).toString()}): ${verdict.issues.join('; ')}`);
+                // ── ARBITER ──────────────────────────────────────────────────
+                // Instead of blindly retrying, ask the arbiter to analyze the
+                // full history and decide: retry with refined feedback, escalate
+                // to user, or accept the implementation as-is.
+                const arbiterDecision = await this.#runArbiter(node, activeCriteria, attemptHistory);
+
+                // Log the decision to the ledger
+                eventBus.emit({
+                    eventId: crypto.randomUUID(),
+                    timestamp: new Date().toISOString(),
+                    eventType: 'QA_ARBITER_DECISION',
+                    sourceId: this.agentId,
+                    targetId: null,
+                    traceId: this.traceId,
+                    payload: {
+                        nodeId: node.id,
+                        attempt,
+                        ...arbiterDecision,
+                    },
+                } as unknown as SystemEvent);
+
+                switch (arbiterDecision.decision) {
+                    case 'retry':
+                        arbiterSweFeedback = arbiterDecision.sweFeedback;
+                        arbiterQaGuidance = arbiterDecision.qaGuidance;
+                        if (arbiterDecision.updatedAcceptanceCriteria !== undefined) {
+                            activeCriteria = arbiterDecision.updatedAcceptanceCriteria;
+                        }
+                        priorIssues = verdict.issues;
+                        logger.info(`[${this.agentId}] Arbiter: retry (attempt ${(attempt + 1).toString()}). Reasoning: ${arbiterDecision.reasoning.slice(0, 200)}`);
+                        attempt++;
+                        continue;
+
+                    case 'ask_user': {
+                        // Save state so PM can resume when user responds
+                        saveState({
+                            traceId: this.traceId,
+                            nodeId: node.id,
+                            sweId,
+                            objective: node.objective,
+                            acceptanceCriteria: activeCriteria,
+                            phase: 'blocked',
+                            attempt,
+                            filesChanged: artifact.filesChanged,
+                            priorIssues: verdict.issues,
+                            attemptHistory,
+                            arbiterGuidance: {
+                                ...(arbiterQaGuidance !== undefined ? { qaGuidance: arbiterQaGuidance } : {}),
+                                ...(activeCriteria !== node.acceptanceCriteria ? { updatedAcceptanceCriteria: activeCriteria } : {}),
+                            },
+                            conductorSummary: artifact.summary,
+                            savedAt: new Date().toISOString(),
+                        });
+                        node.status = 'blocked';
+
+                        const question = arbiterDecision.userQuestion ?? arbiterDecision.reasoning;
+                        logger.info(`[${this.agentId}] Arbiter: ask_user for node [${node.id}]: ${question.slice(0, 200)}`);
+
+                        // Notify user via AGENT_INPUT_REQUIRED event
+                        this.emit('AGENT_INPUT_REQUIRED', {
+                            question,
+                            nodeId: node.id,
+                            attempt,
+                        });
+
+                        return { success: false, summary: `Blocked: ${question}`, blocked: true, userQuestion: question };
+                    }
+
+                    case 'accept':
+                        if (arbiterDecision.updatedAcceptanceCriteria !== undefined) {
+                            activeCriteria = arbiterDecision.updatedAcceptanceCriteria;
+                        }
+                        passed = true;
+                        finalSummary = artifact.summary;
+                        clearState();
+                        logger.info(`[${this.agentId}] Arbiter: accept (overriding QA). Reasoning: ${arbiterDecision.reasoning.slice(0, 200)}`);
+                        break;
+                }
+            }
+
+            // Safety cap hit
+            if (!passed && attempt >= MAX_ARBITER_ROUNDS) {
+                const summary = attemptHistory.map((a) =>
+                    `Attempt ${(a.attempt + 1).toString()}: ${a.qaVerdict.issues.join('; ')}`,
+                ).join('\n');
+                logger.warn(`[${this.agentId}] Safety cap hit (${MAX_ARBITER_ROUNDS.toString()} attempts). Forcing ask_user.`);
+
+                const question = `After ${MAX_ARBITER_ROUNDS.toString()} attempts, QA is still failing. Here's the history:\n${summary}\n\nHow would you like to proceed?`;
+
+                saveState({
+                    traceId: this.traceId,
+                    nodeId: node.id,
+                    sweId,
+                    objective: node.objective,
+                    acceptanceCriteria: activeCriteria,
+                    phase: 'blocked',
+                    attempt,
+                    filesChanged: [],
+                    priorIssues,
+                    attemptHistory,
+                    conductorSummary: '',
+                    savedAt: new Date().toISOString(),
+                });
+                node.status = 'blocked';
+
+                // Notify user via AGENT_INPUT_REQUIRED event
+                this.emit('AGENT_INPUT_REQUIRED', {
+                    question,
+                    nodeId: node.id,
+                    attempt,
+                });
+
+                this.#emitSweEvent(sweId, 'STATE_CHANGED', {
+                    message: `Blocked after ${MAX_ARBITER_ROUNDS.toString()} attempts — waiting for user input`,
+                    phase: 'implement',
+                });
+
+                return { success: false, summary: `Blocked: ${question}`, blocked: true, userQuestion: question };
             }
         } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
@@ -797,7 +1231,6 @@ Guidelines:
             this.#emitSweEvent(sweId, 'STATE_CHANGED', {
                 message: `Failed: ${msg}`,
                 phase: 'implement',
-                taskComplete: true,
             });
             this.#emitSweEvent(sweId, 'AGENT_TERMINATED', {
                 reason: 'error',
@@ -808,7 +1241,7 @@ Guidelines:
         }
 
         if (!passed) {
-            const failSummary = `Failed QA after ${(MAX_RETRIES + 1).toString()} attempt(s). Last issues: ${priorIssues.join('; ').slice(0, 300)}`;
+            const failSummary = `Failed QA after ${attemptHistory.length.toString()} attempt(s). Last issues: ${priorIssues.join('; ').slice(0, 300)}`;
             this.#emitSweEvent(sweId, 'STATE_CHANGED', {
                 message: failSummary,
                 phase: 'implement',
@@ -821,11 +1254,10 @@ Guidelines:
             return { success: false, summary: failSummary };
         }
 
-        // Success — emit summary with file count
+        // Success — emit summary for this node (not the whole feature)
         this.#emitSweEvent(sweId, 'STATE_CHANGED', {
             message: finalSummary || 'Task completed successfully.',
             phase: 'implement',
-            taskComplete: true,
         });
         this.#emitSweEvent(sweId, 'AGENT_TERMINATED', {
             reason: 'task_complete',
@@ -838,99 +1270,242 @@ Guidelines:
     // ── Private — helpers ─────────────────────────────────────────────────────
 
     /**
-     * Build a clean, focused prompt for the SWE agent.
+     * Wait for user input to resume a blocked node.
      *
-     * Context filtering rules:
-     *   - "backend" tasks get NO design spec — it's irrelevant noise
-     *   - "frontend"/"fullstack" tasks get the full design spec
-     *   - Project root + sandbox info is handled by runConductorTrack (not here)
-     *   - Acceptance criteria appear exactly ONCE
+     * Listens for USER_INTERVENTION events (user messages sent via the chat)
+     * targeting this trace. Returns the user's text, or null on timeout (24h).
      */
-    #buildSweObjective(node: TaskNode, researchContext: string, priorIssues: string[], attempt: number, designSpec: UxDesignSpec | null = null): string {
-        const isFrontend = node.taskType === 'frontend' || node.taskType === 'fullstack';
-        const includeDesign = isFrontend && hasDesignSpec(designSpec);
+    async #waitForUserInput(blockedNodeId: string): Promise<string | null> {
+        logger.info(`[${this.agentId}] Waiting for user input to resume blocked node [${blockedNodeId}]`);
 
-        const parts: string[] = [
+        return new Promise<string | null>((resolve) => {
+            const TIMEOUT_MS = 24 * 60 * 60 * 1000; // 24 hours
+            const timeout = setTimeout(() => {
+                unsub();
+                logger.warn(`[${this.agentId}] Timed out waiting for user input on blocked node [${blockedNodeId}]`);
+                resolve(null);
+            }, TIMEOUT_MS);
+
+            // Listen for user messages (USER_INTERVENTION) on this trace
+            const unsub = eventBus.subscribe('USER_INTERVENTION', (event: SystemEvent) => {
+                if (event.traceId !== this.traceId) return;
+                const text = typeof event.payload['text'] === 'string' ? event.payload['text'] : '';
+                if (text === '') return;
+
+                clearTimeout(timeout);
+                unsub();
+                logger.info(`[${this.agentId}] Received user input for blocked node [${blockedNodeId}]: ${text.slice(0, 200)}`);
+                resolve(text);
+            });
+        });
+    }
+
+    /**
+     * QA arbiter: analyze the full attempt history and decide what to do next.
+     *
+     * The arbiter replaces the old hardcoded retry limit with intelligent routing.
+     * It compares QA issues against actual acceptance criteria, detects test-plan
+     * drift, identifies unfixable issues, and can refine acceptance criteria.
+     */
+    async #runArbiter(
+        node: TaskNode,
+        activeCriteria: string,
+        history: AttemptRecord[],
+    ): Promise<QaArbiterDecision> {
+        const historyText = history.map((h) => {
+            const verdictLabel = h.qaVerdict.passed ? 'PASSED' : 'FAILED';
+            const issuesList = h.qaVerdict.issues.length > 0
+                ? h.qaVerdict.issues.map((i) => `    - ${i}`).join('\n')
+                : '    (none)';
+            const warningsList = h.qaVerdict.warnings.length > 0
+                ? h.qaVerdict.warnings.map((w) => `    - ${w}`).join('\n')
+                : '    (none)';
+            return [
+                `### Attempt ${(h.attempt + 1).toString()}`,
+                `SWE Summary: ${h.sweSummary.slice(0, 500)}`,
+                `QA Verdict: ${verdictLabel}`,
+                `Issues:\n${issuesList}`,
+                `Warnings:\n${warningsList}`,
+                h.qaVerdict.summary !== undefined ? `QA Summary: ${h.qaVerdict.summary.slice(0, 300)}` : '',
+            ].filter(Boolean).join('\n');
+        }).join('\n\n');
+
+        const systemPrompt = `You are a QA arbiter. A software engineer built a feature and QA tested it.
+QA found issues. Your job is to analyze the full attempt history and decide what happens next.
+
+You MUST respond with a single JSON object matching this schema:
+{
+  "decision": "retry" | "ask_user" | "accept",
+  "reasoning": "...",
+  "sweFeedback": "..." (only if retry),
+  "qaGuidance": "..." (only if retry),
+  "updatedAcceptanceCriteria": "..." (if criteria need refining),
+  "userQuestion": "..." (only if ask_user)
+}
+
+Decision guide:
+- "retry" — The issues are REAL and FIXABLE by the SWE. Provide refined, actionable feedback
+  in sweFeedback (filter out test-plan-drift). Provide qaGuidance to prevent QA from repeating
+  mistakes (e.g., testing wrong endpoints, inventing requirements).
+- "ask_user" — The requirements are ambiguous, conflicting, or need clarification that only
+  the user can provide. Provide a specific userQuestion. Also use this if the SWE has failed
+  the same issue 3+ times — it may need human guidance.
+- "accept" — QA is being unreasonable: testing things NOT in the acceptance criteria,
+  applying over-strict judgment, or inventing requirements. The implementation satisfies the
+  actual criteria. You may update acceptanceCriteria to clarify what was actually required.
+
+Key anti-patterns to watch for:
+- Test plan drift: QA fails for different reasons each attempt (score field, sentiment field, etc.)
+  that aren't in the original acceptance criteria
+- Wrong endpoint: QA tests /api/reddit when the SWE built /api/reddit/posts
+- Over-strict content judgment: QA flags benign content as violating filters
+- Repeated identical failures: SWE can't fix the issue — may need user input
+- Port confusion: QA tests on wrong port`;
+
+        const userPrompt = `## Original Objective
+${node.objective}
+
+## Acceptance Criteria
+${activeCriteria}
+
+## Attempt History
+${historyText}
+
+Analyze the history and respond with your JSON decision.`;
+
+        try {
+            const completion = await generateWithRawTools(
+                [
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: userPrompt },
+                ],
+                [],
+                'low',
+            );
+            const raw = extractTextContent(completion).trim();
+
+            // Extract JSON from the response (may be wrapped in markdown code fences)
+            const jsonMatch = /\{[\s\S]*\}/.exec(raw);
+            if (jsonMatch !== null) {
+                const parsed = JSON.parse(jsonMatch[0]) as Record<string, unknown>;
+                const result = QaArbiterDecisionSchema.safeParse(parsed);
+                if (result.success) return result.data;
+                logger.warn(`[${this.agentId}] Arbiter output failed schema validation: ${result.error.message}`);
+            }
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            logger.warn(`[${this.agentId}] Arbiter LLM call failed: ${msg}`);
+        }
+
+        // Fallback: retry with raw issues (behaves like old loop)
+        const lastAttempt = history[history.length - 1];
+        return {
+            decision: 'retry',
+            reasoning: 'Arbiter fallback — LLM call failed, retrying with raw QA issues.',
+            sweFeedback: lastAttempt?.qaVerdict.issues.join('\n') ?? 'Fix the QA issues.',
+        };
+    }
+
+    /**
+     * Use a low-tier LLM to build a focused, task-specific briefing for the
+     * SWE agent. The LLM selects only the context blocks relevant to this
+     * specific task, keeping the prompt lean and focused.
+     *
+     * Non-negotiable sections (acceptance criteria, QA retry context) are
+     * always included — the LLM only controls the supporting context.
+     *
+     * Falls back to a minimal objective + acceptance criteria if the LLM
+     * call fails.
+     */
+    async #buildSweObjective(node: TaskNode, researchContext: string, priorIssues: string[], attempt: number, designSpec: UxDesignSpec | null = null): Promise<string> {
+        // ── Gather all available context blocks ──────────────────────────────
+        const contextBlocks: Record<string, string> = {};
+
+        if (hasDesignSpec(designSpec) && designSpec !== null) {
+            const designParts = [
+                `Layout: ${designSpec.layout}`,
+                `Components: ${designSpec.componentHierarchy}`,
+                `User Flow: ${designSpec.userFlow}`,
+                `Styling: ${designSpec.styling}`,
+            ];
+            if (designSpec.wireframe !== '') designParts.push(`Wireframe:\n\`\`\`\n${designSpec.wireframe}\n\`\`\``);
+            if (designSpec.uxAcceptanceCriteria !== '') designParts.push(`UX Acceptance Criteria: ${designSpec.uxAcceptanceCriteria}`);
+            contextBlocks['UX_DESIGN_SPEC'] = designParts.join('\n');
+        }
+
+        if (researchContext !== '' && researchContext !== 'No prior context found.') {
+            contextBlocks['RESEARCH_CONTEXT'] = researchContext;
+        }
+
+        try {
+            const manifest = credentialStore.getManifest();
+            if (manifest.length > 0) {
+                contextBlocks['AVAILABLE_SERVICES'] = manifest
+                    .map((s) => `- ${s.serviceLabel} (${s.credentialType}): process.env.${s.envVarName}`)
+                    .join('\n');
+            }
+        } catch { /* non-fatal */ }
+
+        // ── Ask LLM to build the briefing ────────────────────────────────────
+        const blockList = Object.entries(contextBlocks)
+            .map(([key, val]) => `<context_block name="${key}">\n${val}\n</context_block>`)
+            .join('\n\n');
+
+        const systemPrompt = `You are a technical project manager briefing a software engineer on their next task.
+Your job is to write a focused, actionable briefing that contains ONLY the information
+this engineer needs to complete their specific task. Do not include irrelevant context.
+
+Rules:
+- Start with the task objective (rewrite it to be clear and self-contained if needed)
+- Include the acceptance criteria VERBATIM — the engineer will be tested on every one
+- From the available context blocks, include ONLY the ones directly relevant to this task
+- If a context block isn't useful for this specific task, omit it entirely
+- Keep the briefing concise — every sentence should be actionable
+- End with a checklist of the acceptance criteria the engineer must satisfy`;
+
+        const userPrompt = `## Task
+Objective: ${node.objective}
+Task type: ${node.taskType}
+Acceptance criteria: ${node.acceptanceCriteria}
+${attempt > 0 && priorIssues.length > 0
+    ? `\nQA FAILED (attempt ${attempt.toString()}/${MAX_ARBITER_ROUNDS.toString()}) — the engineer MUST fix these issues:\n${priorIssues.map((i) => `- ${i}`).join('\n')}\n`
+    : ''}
+## Available Context Blocks
+${blockList !== '' ? blockList : '(none available)'}
+
+Write the briefing now.`;
+
+        try {
+            const completion = await generateWithRawTools(
+                [
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: userPrompt },
+                ],
+                [],
+                'low',
+            );
+            const briefing = extractTextContent(completion).trim();
+            if (briefing.length > 50) return briefing;
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            logger.warn(`[${this.agentId}] SWE briefing LLM failed, using fallback: ${msg}`);
+        }
+
+        // ── Fallback: minimal objective + acceptance criteria ────────────────
+        const fallback = [
             node.objective,
             '',
             '## Acceptance Criteria',
             node.acceptanceCriteria,
         ];
-
-        // UX Design Spec — only for frontend/fullstack tasks, and only if the spec is real
-        if (includeDesign && designSpec !== null) {
-            parts.push(
-                '',
-                '## UX Design Spec',
-                'The UX Designer has specified this design. Follow it faithfully.',
-                '',
-                `**Layout:** ${designSpec.layout}`,
-                '',
-                `**Components:** ${designSpec.componentHierarchy}`,
-                '',
-                `**User Flow:** ${designSpec.userFlow}`,
-                '',
-                `**Styling:** ${designSpec.styling}`,
-            );
-            if (designSpec.wireframe !== '') {
-                parts.push(
-                    '',
-                    '**Wireframe:**',
-                    '```',
-                    designSpec.wireframe,
-                    '```',
-                );
-            }
-            if (designSpec.uxAcceptanceCriteria !== '') {
-                parts.push(
-                    '',
-                    '**UX Acceptance Criteria:**',
-                    designSpec.uxAcceptanceCriteria,
-                );
-            }
-        }
-
-        // Research context — brief and relevant
-        if (researchContext !== '' && researchContext !== 'No prior context found.') {
-            parts.push(
-                '',
-                '## Research Context',
-                researchContext,
-            );
-        }
-
-        // Tech stack (version-correct, minimal)
-        parts.push(
-            '',
-            '## Tech Stack',
-            'Next.js 15 (App Router) + React 19, Tailwind CSS, shadcn/ui, TypeScript, pnpm workspaces.',
-            'Backend: Node.js + Express (apps/backend). Frontend pages: apps/web/src/app/ as route segments.',
-        );
-
-        // Available external services (API keys, etc.)
-        try {
-            const manifest = credentialStore.getManifest();
-            if (manifest.length > 0) {
-                parts.push(
-                    '',
-                    '## Available Services',
-                    ...manifest.map((s) => `- **${s.serviceLabel}** (${s.credentialType}): \`process.env.${s.envVarName}\``),
-                );
-            }
-        } catch {
-            // Non-fatal — credential store may not be initialized
-        }
-
-        // QA retry context
         if (attempt > 0 && priorIssues.length > 0) {
-            parts.push(
+            fallback.push(
                 '',
-                `## QA Failed (attempt ${attempt.toString()}/${MAX_RETRIES.toString()}) — Fix These Issues`,
+                `## QA Failed (attempt ${attempt.toString()}/${MAX_ARBITER_ROUNDS.toString()}) — Fix These Issues`,
                 ...priorIssues.map((issue) => `- ${issue}`),
             );
         }
-
-        return parts.join('\n');
+        return fallback.join('\n');
     }
 
     #readSweArtifact(subtask: string, sweId: string): SweArtifact {
@@ -950,10 +1525,33 @@ Guidelines:
                 summary: content,
             };
         }
-        return { subtask, filesChanged: [], commandsRun: [], errors: ['No artifact found'], success: false, summary: 'No artifact' };
+        return { subtask, filesChanged: [], commandsRun: [], errors: ['No artifact found'], success: false, summary: '' };
+    }
+
+    /**
+     * Build a context string describing completed sibling tasks and their results.
+     * Passed to sub-PMs so they know what work has already been done.
+     */
+    private _buildSiblingContext(graph: TaskGraph, completedSummaries: string[]): string {
+        const parts = [`Feature: ${graph.rootObjective}`, ''];
+
+        if (completedSummaries.length > 0) {
+            parts.push('## Completed Sibling Tasks', ...completedSummaries, '');
+        }
+
+        const pending = graph.nodes.filter((n) => n.status === 'pending');
+        if (pending.length > 0) {
+            parts.push(
+                '## Upcoming Tasks',
+                ...pending.map((n) => `- [${n.id}]: ${n.objective}`),
+            );
+        }
+
+        return parts.join('\n');
     }
 
     #emitGraph(graph: TaskGraph, message: string): void {
+        const isRootGraph = this.#subPmContext === null;
         eventBus.emit({
             eventId: crypto.randomUUID(),
             timestamp: new Date().toISOString(),
@@ -964,6 +1562,7 @@ Guidelines:
             payload: {
                 graph: JSON.parse(JSON.stringify(graph)) as Record<string, unknown>,
                 message,
+                isRootGraph,
             },
         } as unknown as import('@ai-hivemind/shared').SystemEvent);
     }

@@ -26,9 +26,13 @@ export abstract class BaseAgent {
     /** Trace context — links all events from this run to a single user command. */
     readonly traceId: string;
 
-    protected constructor(agentId: string, traceId: string) {
+    /** Parent agent ID for hierarchy tracking (null for root-level agents). */
+    readonly parentAgentId: string | null;
+
+    protected constructor(agentId: string, traceId: string, parentAgentId: string | null = null) {
         this.agentId = agentId;
         this.traceId = traceId;
+        this.parentAgentId = parentAgentId;
     }
 
     /**
@@ -47,9 +51,10 @@ export abstract class BaseAgent {
         this.emit('AGENT_SPAWNED', {
             role,
             agentId: this.agentId,
+            ...(this.parentAgentId !== null ? { parentAgentId: this.parentAgentId } : {}),
             message: `${role} agent spawned.`,
         });
-        logger.info(`[${this.agentId}] Spawned (role=${role})`);
+        logger.info(`[${this.agentId}] Spawned (role=${role}${this.parentAgentId !== null ? `, parent=${this.parentAgentId}` : ''})`);
     }
 
     /**

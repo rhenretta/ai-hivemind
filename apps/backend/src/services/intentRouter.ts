@@ -15,6 +15,7 @@ import { type SystemEvent } from '@ai-hivemind/shared';
 import { extractTextContent, generateWithRawTools } from './llm.js';
 import { getEventsByType } from './ledgerStore.js';
 import { logger } from './logger.js';
+import { sessionStore } from './sessionStore.js';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -77,113 +78,39 @@ Respond with ONLY a JSON object (no markdown fences):
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
- * Build a summary of active features from the ledger.
- * Queries USER_COMMAND events for titles and STATE_CHANGED for latest status.
+ * Build a summary of active features/sessions.
+ * Reads from the persistent sessionStore. Enriches blocked sessions with the
+ * pending question from the ledger (which sessionStore doesn't track).
  */
 export function getFeatureSummaries(): FeatureSummary[] {
-    const commands = getEventsByType('USER_COMMAND');
-    const stateChanges = getEventsByType('STATE_CHANGED');
+    const sessions = sessionStore.listSessions();
+
+    // Build a map for quick lookup when enriching with blocked questions
+    const summaries: FeatureSummary[] = sessions.map((s) => ({
+        id: s.id,
+        title: s.title,
+        status: s.status,
+        lastActivity: s.updatedAt,
+    }));
+
+    // Enrich blocked sessions with the pending question from ledger
     const inputRequired = getEventsByType('AGENT_INPUT_REQUIRED');
-    const errors = getEventsByType('ERROR');
-    const deployed = getEventsByType('FEATURE_DEPLOYED');
+    for (const summary of summaries) {
+        if (summary.status !== 'blocked') continue;
 
-    // Build a map of traceId → feature summary
-    const features = new Map<string, FeatureSummary>();
-
-    for (const cmd of commands) {
-        const traceId = cmd.traceId;
-        if (traceId === undefined) continue;
-        const title = typeof cmd.payload['originalText'] === 'string'
-            ? cmd.payload['originalText']
-            : typeof cmd.payload['objective'] === 'string'
-                ? cmd.payload['objective']
-                : 'Unknown';
-        // Only set title from the first USER_COMMAND (original request)
-        if (!features.has(traceId)) {
-            features.set(traceId, {
-                id: traceId,
-                title,
-                status: 'in_progress',
-                lastActivity: cmd.timestamp,
-            });
+        // Find the most recent AGENT_INPUT_REQUIRED for this session
+        const events = inputRequired.filter((e) => e.traceId === summary.id);
+        const latest = events[events.length - 1];
+        if (latest !== undefined) {
+            summary.blockedQuestion = typeof latest.payload['question'] === 'string'
+                ? latest.payload['question']
+                : typeof latest.payload['text'] === 'string'
+                    ? latest.payload['text']
+                    : undefined;
         }
     }
 
-    // Update statuses from STATE_CHANGED events
-    for (const evt of stateChanges) {
-        const traceId = evt.traceId;
-        if (traceId === undefined) continue;
-        const feature = features.get(traceId);
-        if (feature === undefined) continue;
-
-        feature.lastActivity = evt.timestamp;
-
-        if (evt.payload['taskComplete'] === true) {
-            feature.status = 'completed';
-        }
-    }
-
-    // Update blocked status from AGENT_INPUT_REQUIRED
-    for (const evt of inputRequired) {
-        const traceId = evt.traceId;
-        if (traceId === undefined) continue;
-        const feature = features.get(traceId);
-        if (feature === undefined) continue;
-
-        feature.status = 'blocked';
-        feature.lastActivity = evt.timestamp;
-        feature.blockedQuestion = typeof evt.payload['question'] === 'string'
-            ? evt.payload['question']
-            : typeof evt.payload['text'] === 'string'
-                ? evt.payload['text']
-                : undefined;
-    }
-
-    // Update failed status from ERROR events
-    for (const evt of errors) {
-        const traceId = evt.traceId;
-        if (traceId === undefined) continue;
-        const feature = features.get(traceId);
-        if (feature === undefined) continue;
-
-        feature.status = 'failed';
-        feature.lastActivity = evt.timestamp;
-    }
-
-    // Update live status from FEATURE_DEPLOYED
-    for (const evt of deployed) {
-        const traceId = evt.traceId;
-        if (traceId === undefined) continue;
-        const feature = features.get(traceId);
-        if (feature === undefined) continue;
-
-        feature.status = 'live';
-        feature.lastActivity = evt.timestamp;
-    }
-
-    // Clear blocked status if there's a USER_INTERVENTION after the AGENT_INPUT_REQUIRED
-    const interventions = getEventsByType('USER_INTERVENTION');
-    for (const evt of interventions) {
-        const traceId = evt.traceId;
-        if (traceId === undefined) continue;
-        const feature = features.get(traceId);
-        if (feature === undefined) continue;
-        if (feature.status === 'blocked') {
-            feature.status = 'in_progress';
-            feature.blockedQuestion = undefined;
-            feature.lastActivity = evt.timestamp;
-        }
-    }
-
-    // Remove deleted features
-    const deleted = getEventsByType('FEATURE_DELETED');
-    for (const evt of deleted) {
-        const traceId = evt.traceId;
-        if (traceId === undefined) continue;
-        features.delete(traceId);
-    }
-
-    return Array.from(features.values());
+    return summaries;
 }
 
 /**

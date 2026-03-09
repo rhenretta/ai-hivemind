@@ -35,13 +35,11 @@ httpServer.listen(PORT, () => {
     logger.info(`[Nerve Center] Ledger replay     http://localhost:${PORT}/api/events`);
 
     // ── Sandbox Docker image build ─────────────────────────────────────────────
-    // Build the sandbox image on startup (cached by Docker — near-instant
-    // unless Dockerfile.sandbox or package manifests changed).
-    try {
-        buildSandboxImage();
-    } catch (err) {
+    // Build the sandbox image on startup (async — doesn't block health checks).
+    // Cached by Docker — near-instant unless Dockerfile.sandbox or package manifests changed.
+    buildSandboxImage().catch((err) => {
         logger.warn('[Nerve Center] Sandbox image build failed — sandbox tasks will not work:', err);
-    }
+    });
 
     // ── Stale sandbox cleanup ─────────────────────────────────────────────────
     cleanupStaleSandboxes();

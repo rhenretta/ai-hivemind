@@ -1,11 +1,11 @@
+import { execSync } from 'node:child_process';
 import http from 'node:http';
 
-import { type SystemEvent } from '@ai-hivemind/shared';
+import { type SystemEvent, type RepoConfig, type ProjectProfile } from '@ai-hivemind/shared';
 import cors from 'cors';
 import express, { type Application, type Request, type Response } from 'express';
 import { Server, type Socket } from 'socket.io';
 
-import { ProjectManager } from './agents/projectManager.js';
 import { eventBus } from './eventBus.js';
 // Services — import triggers singleton creation + built-in tool seeding
 import { credentialStore } from './services/credentialStore.js';
@@ -14,8 +14,10 @@ import { classifyIntent, getFeatureSummaries, getRecentChatMessages } from './se
 import { logger } from './services/logger.js';
 import { mcpRegistry } from './services/mcpRegistry.js';
 import { ragStore } from './services/ragStore.js';
-import { mergeFeatureSandbox, destroyFeatureSandbox } from './services/sandboxManager.js';
-// Agent roster — ProjectManager bootstraps on USER_COMMAND events
+import { getEventsByTrace } from './services/ledgerStore.js';
+import { mergeFeatureSandbox, destroyFeatureSandbox, getFeatureSandbox } from './services/sandboxManager.js';
+import { loadPendingState } from './services/taskStateStore.js';
+import { sessionStore } from './services/sessionStore.js';
 
 /**
  * Nerve Center HTTP + WebSocket Server
@@ -148,7 +150,12 @@ app.post('/api/rag/collections', (req: Request, res: Response) => {
 /** Get all entries in a collection. */
 app.get('/api/rag/collections/:name/entries', (req: Request, res: Response) => {
     const { name } = req.params as { name: string };
-    res.json(ragStore.getEntries(name));
+    const traceId = typeof req.query['traceId'] === 'string' ? req.query['traceId'] : '';
+    if (traceId !== '') {
+        res.json(ragStore.getEntriesByTrace(name, traceId));
+    } else {
+        res.json(ragStore.getEntries(name));
+    }
 });
 
 /** Add a memory entry to a collection.
@@ -180,6 +187,26 @@ app.delete('/api/rag/collections/:name/entries/:memoryId', (req: Request, res: R
 });
 
 /**
+ * Cross-collection query: search or list all memory entries for a session.
+ * Query params: ?traceId=<uuid> (required)  ?query=<text> (optional)  ?limit=<n> (optional)
+ */
+app.get('/api/rag/entries', (req: Request, res: Response) => {
+    const traceId = typeof req.query['traceId'] === 'string' ? req.query['traceId'] : '';
+    if (traceId === '') {
+        res.status(400).json({ error: 'traceId query parameter is required' });
+        return;
+    }
+    const query = typeof req.query['query'] === 'string' ? req.query['query'] : undefined;
+    const limit = typeof req.query['limit'] === 'string' ? parseInt(req.query['limit'], 10) : 100;
+
+    if (query !== undefined && query.length > 0) {
+        res.json(ragStore.queryAcrossCollections(traceId, query, limit));
+    } else {
+        res.json(ragStore.getAllEntriesByTrace(traceId, limit));
+    }
+});
+
+/**
  * Legacy RAG Store query endpoint — queries the 'default' collection.
  * Kept for backward compatibility with the simulator and external callers.
  * Query params: ?query=<text>  ?tags=a,b,c
@@ -189,7 +216,13 @@ app.get('/api/memory', (req, res) => {
     const tags = typeof req.query['tags'] === 'string' && req.query['tags'] !== ''
         ? req.query['tags'].split(',')
         : undefined;
-    res.json(ragStore.queryContext('default', query, tags));
+    void ragStore.queryContextSemantic('default', query, tags).then(
+        (results) => res.json(results),
+        (err: unknown) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            res.status(500).json({ error: msg });
+        },
+    );
 });
 
 // ─── Credential Store REST API ───────────────────────────────────────────────
@@ -254,6 +287,221 @@ app.delete('/api/credentials/:id', (req: Request, res: Response) => {
     }
 });
 
+
+// ─── Session Store REST API ──────────────────────────────────────────────────
+
+/** List all sessions. */
+app.get('/api/sessions', (_req, res) => {
+    res.json(sessionStore.listSessions());
+});
+
+/** Get a single session by ID. */
+app.get('/api/sessions/:id', (req: Request, res: Response) => {
+    const { id } = req.params as { id: string };
+    const session = sessionStore.getSession(id);
+    if (session === null) {
+        res.status(404).json({ error: 'Session not found' });
+        return;
+    }
+    res.json(session);
+});
+
+/** Create a new session. Body: { title, repoConfig? } */
+app.post('/api/sessions', (req: Request, res: Response) => {
+    const body = req.body as Record<string, unknown>;
+    const title = typeof body['title'] === 'string' ? body['title'].trim() : '';
+    if (title === '') {
+        res.status(400).json({ error: 'title is required' });
+        return;
+    }
+    try {
+        const repoConfig = body['repoConfig'] as { url: string; defaultBranch: string } | undefined;
+        const session = sessionStore.createSession({
+            title,
+            repoConfig: repoConfig ?? null,
+        });
+        res.status(201).json(session);
+    } catch (err) {
+        res.status(400).json({ error: String(err) });
+    }
+});
+
+/** Update a session. Body: { title?, status?, repoConfig?, projectProfile? } */
+app.patch('/api/sessions/:id', (req: Request, res: Response) => {
+    const { id } = req.params as { id: string };
+    const body = req.body as Record<string, unknown>;
+    const patch: Parameters<typeof sessionStore.updateSession>[1] = {};
+    if (typeof body['title'] === 'string') patch.title = body['title'];
+    if (typeof body['status'] === 'string') patch.status = body['status'] as 'exploring';
+    if (body['repoConfig'] !== undefined) patch.repoConfig = body['repoConfig'] as RepoConfig | null;
+    if (body['projectProfile'] !== undefined) patch.projectProfile = body['projectProfile'] as ProjectProfile | null;
+    const session = sessionStore.updateSession(id, patch);
+    if (session === null) {
+        res.status(404).json({ error: 'Session not found' });
+        return;
+    }
+    res.json(session);
+});
+
+/** Delete a session. */
+app.delete('/api/sessions/:id', (req: Request, res: Response) => {
+    const { id } = req.params as { id: string };
+    // Destroy sandbox if one exists
+    try {
+        destroyFeatureSandbox(id);
+    } catch {
+        // Sandbox may not exist — that's fine
+    }
+    // Clean up session-scoped credentials
+    credentialStore.deleteSessionCredentials(id);
+    const deleted = sessionStore.deleteSession(id);
+    if (deleted) {
+        eventBus.emit({
+            eventId: crypto.randomUUID(),
+            timestamp: new Date().toISOString(),
+            eventType: 'FEATURE_DELETED',
+            sourceId: 'user',
+            targetId: null,
+            traceId: id,
+            payload: {},
+        });
+        res.status(204).end();
+    } else {
+        res.status(404).json({ error: 'Session not found' });
+    }
+});
+
+// ─── Session-Scoped Credentials ──────────────────────────────────────────────
+
+/** List session-scoped credentials (masked). */
+app.get('/api/sessions/:id/credentials', (req: Request, res: Response) => {
+    const { id } = req.params as { id: string };
+    res.json(credentialStore.listCredentialsBySession(id));
+});
+
+/** Store a session-scoped credential. */
+app.post('/api/sessions/:id/credentials', (req: Request, res: Response) => {
+    const { id: sessionId } = req.params as { id: string };
+    const body = req.body as Record<string, unknown>;
+    const envVarName = typeof body['envVarName'] === 'string' ? body['envVarName'].trim() : '';
+    const value = typeof body['value'] === 'string' ? body['value'] : '';
+    const serviceLabel = typeof body['serviceLabel'] === 'string' ? body['serviceLabel'].trim() : envVarName;
+    const serviceName = typeof body['serviceName'] === 'string' ? body['serviceName'].trim() : envVarName.toLowerCase();
+
+    if (!envVarName || !value) {
+        res.status(400).json({ error: 'envVarName and value are required' });
+        return;
+    }
+
+    try {
+        const credential = credentialStore.storeCredential({
+            serviceName,
+            serviceLabel,
+            envVarName,
+            value,
+            sessionId,
+            credentialType: typeof body['credentialType'] === 'string' ? body['credentialType'] : 'api_key',
+        });
+        res.status(201).json(credential);
+    } catch (err) {
+        res.status(400).json({ error: String(err) });
+    }
+});
+
+/** Delete a session-scoped credential. */
+app.delete('/api/sessions/:id/credentials/:credId', (req: Request, res: Response) => {
+    const { credId } = req.params as { id: string; credId: string };
+    const deleted = credentialStore.deleteCredential(credId);
+    if (deleted) {
+        res.status(204).end();
+    } else {
+        res.status(404).json({ error: 'Credential not found' });
+    }
+});
+
+// ─── Session artifacts aggregation ───────────────────────────────────────────
+
+app.get('/api/sessions/:id/artifacts', (req: Request, res: Response) => {
+    const { id } = req.params as { id: string };
+    const session = sessionStore.getSession(id);
+    if (session === undefined) {
+        res.status(404).json({ error: 'Session not found' });
+        return;
+    }
+
+    // SWE artifacts — parse content as SweArtifact where possible
+    const sweEntries = ragStore.getEntriesByTrace('swe-outputs', id);
+    const sweArtifacts = sweEntries.map((entry) => {
+        let artifact = null;
+        try { artifact = JSON.parse(entry.content) as Record<string, unknown>; } catch { /* raw text */ }
+        return {
+            memoryId: entry.memoryId,
+            agentId: entry.agentId,
+            timestamp: entry.timestamp,
+            artifact,
+            rawContent: entry.content,
+        };
+    });
+
+    // Research findings
+    const researchEntries = ragStore.getEntriesByTrace('research-context', id);
+    const researchFindings = researchEntries.map((entry) => ({
+        memoryId: entry.memoryId,
+        agentId: entry.agentId,
+        timestamp: entry.timestamp,
+        content: entry.content,
+        tags: entry.tags,
+    }));
+
+    // QA verdicts from ledger
+    const traceEvents = getEventsByTrace(id);
+    const qaVerdicts = traceEvents
+        .filter((e) => e.eventType === 'QA_VERDICT')
+        .map((e) => ({
+            eventId: e.eventId,
+            timestamp: e.timestamp,
+            subtask: typeof e.payload['subtask'] === 'string' ? e.payload['subtask'] : '',
+            passed: e.payload['passed'] === true,
+            issues: Array.isArray(e.payload['issues']) ? e.payload['issues'] as string[] : [],
+            warnings: Array.isArray(e.payload['warnings']) ? e.payload['warnings'] as string[] : [],
+            summary: typeof e.payload['summary'] === 'string' ? e.payload['summary'] : undefined,
+            checksRun: Array.isArray(e.payload['checksRun']) ? e.payload['checksRun'] as string[] : [],
+        }));
+
+    // Sandbox status
+    let sandbox = null;
+    const handle = getFeatureSandbox(id);
+    if (handle !== null) {
+        let running = false;
+        try {
+            const out = execSync(
+                `docker inspect --format "{{.State.Running}}" ${handle.containerName}`,
+                { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
+            ).trim();
+            running = out === 'true';
+        } catch { /* container may not exist */ }
+        sandbox = {
+            containerName: handle.containerName,
+            running,
+            backendPort: handle.backendPort,
+            webPort: handle.webPort,
+        };
+    }
+
+    // Task state snapshot
+    let taskState = null;
+    const pending = loadPendingState();
+    if (pending !== null && pending.traceId === id) {
+        taskState = {
+            phase: pending.phase,
+            objective: pending.objective,
+            attempt: pending.attempt,
+            filesChanged: pending.filesChanged,
+        };
+    }
+
+    res.json({ sweArtifacts, researchFindings, qaVerdicts, sandbox, taskState });
+});
 
 // ─── HTTP server + Socket.io ──────────────────────────────────────────────────
 
@@ -378,7 +626,8 @@ io.on('connection', (socket: Socket) => {
                 });
 
                 // Route through the Dialogue Agent.
-                const dialogueAgent = getOrCreateDialogueAgent(traceId);
+                // Pass user text as initial title for new sessions
+                const dialogueAgent = getOrCreateDialogueAgent(traceId, text.slice(0, 120));
                 void dialogueAgent.handleUserMessage(text);
             } catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);
@@ -401,7 +650,7 @@ io.on('connection', (socket: Socket) => {
                     traceId,
                     payload: { originalText: text, intent: 'new_feature' },
                 });
-                const dialogueAgent = getOrCreateDialogueAgent(traceId);
+                const dialogueAgent = getOrCreateDialogueAgent(traceId, text.slice(0, 120));
                 void dialogueAgent.handleUserMessage(text);
             }
         })();
@@ -426,9 +675,10 @@ io.on('connection', (socket: Socket) => {
         });
     });
 
-    socket.on('user:delete-feature', (data: { traceId: string }) => {
+    // Accept both old and new event names for backwards compatibility
+    const handleDeleteSession = (data: { traceId: string }) => {
         const { traceId } = data;
-        logger.info(`[Nerve Center] user:delete-feature from socket=${socket.id} | traceId=${traceId}`);
+        logger.info(`[Nerve Center] user:delete-session from socket=${socket.id} | traceId=${traceId}`);
 
         // Destroy sandbox if one exists
         try {
@@ -436,6 +686,9 @@ io.on('connection', (socket: Socket) => {
         } catch {
             // Sandbox may not exist — that's fine
         }
+
+        // Delete from session store
+        sessionStore.deleteSession(traceId);
 
         eventBus.emit({
             eventId: crypto.randomUUID(),
@@ -446,7 +699,9 @@ io.on('connection', (socket: Socket) => {
             traceId,
             payload: {},
         });
-    });
+    };
+    socket.on('user:delete-feature', handleDeleteSession);
+    socket.on('user:delete-session', handleDeleteSession);
 
     socket.on('user:checkout', async (data: { traceId: string }) => {
         const { traceId } = data;
@@ -494,27 +749,23 @@ eventBus.subscribeAll((event: SystemEvent) => {
     io.emit('system:event', event);
 });
 
-// ─── Agentic Core — USER_COMMAND → ProjectManager ─────────────────────────────
+// ─── Agentic Core — USER_COMMAND Ledger Logging ───────────────────────────────
 
 /**
  * Listen for USER_COMMAND events on the EventBus.
  *
- * When a command arrives (injected via /api/events/inject or a future Socket.io
- * message from the Command Center), instantiate the ProjectManager and kick off
- * the RPIV pipeline (Research → Design → Decompose → Execute).
+ * Previously this spawned a ProjectManager to run the RPIV pipeline.
+ * Now the DialogueAgent owns the task graph and spawns FeatureDeveloper
+ * directly — USER_COMMAND events are logged for ledger replay only.
  *
- * Execution is non-blocking — the HTTP/WebSocket server continues serving
- * requests while the ProjectManager works asynchronously.
- *
- * Errors in the run loop are caught here; a crash in one run never takes down
- * the server or prevents future commands from being processed.
+ * The event is still emitted by DialogueAgent so the frontend can
+ * reconstruct chat history from the ledger on replay.
  */
 eventBus.subscribe('USER_COMMAND', (event: SystemEvent) => {
-    // Only spawn ProjectManager for commands from the Dialogue Agent.
-    // USER_COMMAND events from sourceId='user' are chat ledger entries
-    // for replay (user message reconstruction) — not PM triggers.
-    if (event.sourceId === 'user') return;
-
+    // USER_COMMAND events are now ledger entries only — no PM spawning.
+    // The DialogueAgent handles the full lifecycle internally by:
+    //   1. Creating/updating the task graph directly
+    //   2. Spawning FeatureDeveloper to execute ready tasks
     const traceId = event.traceId ?? event.eventId;
     const objective = typeof event.payload['objective'] === 'string'
         ? event.payload['objective']
@@ -522,12 +773,5 @@ eventBus.subscribe('USER_COMMAND', (event: SystemEvent) => {
             ? event.payload['message']
             : 'No objective provided.';
 
-    logger.info(`[Nerve Center] USER_COMMAND received | traceId=${traceId} | objective="${objective.slice(0, 80)}…"`);
-
-    // Fire-and-forget — ProjectManager manages its own error handling
-    const pmId = `project-manager.${crypto.randomUUID().slice(0, 8)}`;
-    void new ProjectManager(pmId, traceId).run(objective).catch((err: unknown) => {
-        const msg = err instanceof Error ? err.message : String(err);
-        logger.error(`[Nerve Center] ProjectManager run failed for traceId=${traceId}: ${msg}`);
-    });
+    logger.info(`[Nerve Center] USER_COMMAND logged | traceId=${traceId} | objective="${objective.slice(0, 80)}…"`);
 });

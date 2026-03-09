@@ -182,16 +182,19 @@ async function httpGet(
  */
 async function executeCli(command: string, timeoutMs = 30_000): Promise<string> {
     try {
+        // Resolve monorepo root — backend cwd is apps/backend/ under turbo dev
+        const monorepoRoot = resolve(process.cwd(), '../..');
         const { stdout, stderr } = await withTimeout(
-            execAsync(command, { timeout: timeoutMs }),
+            execAsync(command, { timeout: timeoutMs, cwd: monorepoRoot }),
             timeoutMs + 1000,
             'execute_cli_command',
         );
+        const MAX_OUTPUT = 12288; // 12KB — same cap as read_file
         const out = stdout.trim();
         const err = stderr.trim();
         const parts: string[] = [];
-        if (out !== '') parts.push(`stdout:\n${out}`);
-        if (err !== '') parts.push(`stderr:\n${err}`);
+        if (out !== '') parts.push(`stdout:\n${out.length > MAX_OUTPUT ? `${out.slice(0, MAX_OUTPUT)}\n[...truncated at 12KB]` : out}`);
+        if (err !== '') parts.push(`stderr:\n${err.length > MAX_OUTPUT ? `${err.slice(0, MAX_OUTPUT)}\n[...truncated at 12KB]` : err}`);
         return parts.length > 0 ? parts.join('\n') : '(no output)';
     } catch (e) {
         const err = e as { stdout?: string; stderr?: string; message?: string };
@@ -203,7 +206,9 @@ async function executeCli(command: string, timeoutMs = 30_000): Promise<string> 
  * read_file — read a file from disk
  */
 async function readFileTool(filePath: string, encoding: 'utf8' | 'base64' = 'utf8'): Promise<string> {
-    const safePath = isAbsolute(filePath) ? filePath : resolve(process.cwd(), filePath);
+    // Resolve relative paths from monorepo root, not apps/backend/
+    const monorepoRoot = resolve(process.cwd(), '../..');
+    const safePath = isAbsolute(filePath) ? filePath : resolve(monorepoRoot, filePath);
     const buffer = await readFile(safePath);
     const content = encoding === 'base64' ? buffer.toString('base64') : buffer.toString('utf8');
     return content.length > 12288 ? `${content.slice(0, 12288)}\n[...truncated at 12KB]` : content;

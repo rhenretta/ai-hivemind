@@ -19,6 +19,18 @@ const STATE_FILE = '/tmp/conductor-task-state.json';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
+/** Record of a single SWE+QA attempt, kept for the arbiter's history analysis. */
+export interface AttemptRecord {
+    attempt: number;
+    sweSummary: string;
+    qaVerdict: {
+        passed: boolean;
+        issues: string[];
+        warnings: string[];
+        summary?: string;
+    };
+}
+
 export interface PersistedTaskState {
     /** Original trace ID from the user command — used to reconnect Command Center */
     traceId: string;
@@ -31,7 +43,7 @@ export interface PersistedTaskState {
     /** Acceptance criteria string */
     acceptanceCriteria: string;
     /** Current execution phase */
-    phase: 'conductor' | 'awaiting-qa' | 'done';
+    phase: 'conductor' | 'awaiting-qa' | 'blocked' | 'done';
     /** Retry attempt number (0-indexed) */
     attempt: number;
     /** Files confirmed written by Claude Code (for SweArtifact) */
@@ -44,6 +56,13 @@ export interface PersistedTaskState {
     conductorSummary: string;
     /** ISO timestamp */
     savedAt: string;
+    /** Full attempt history for arbiter re-entry after blocked resume */
+    attemptHistory?: AttemptRecord[];
+    /** Last arbiter output, carried into the next QA run */
+    arbiterGuidance?: {
+        qaGuidance?: string;
+        updatedAcceptanceCriteria?: string;
+    };
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────

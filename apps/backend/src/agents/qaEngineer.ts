@@ -290,6 +290,7 @@ const QA_OPENAI_TOOLS: OpenAI.ChatCompletionTool[] = [
                                 type: { type: 'string', enum: ['api', 'visual', 'build', 'content', 'interaction', 'custom'], description: 'Test category' },
                                 status: { type: 'string', enum: ['pending', 'running', 'passed', 'failed', 'skipped'], description: 'Current status' },
                                 result: { type: 'string', description: 'Explanation of pass/fail/skip (required for non-pending tests)' },
+                                severity: { type: 'string', enum: ['blocking', 'warning'], description: 'Whether a failure blocks the verdict. "blocking" = core functionality broken, must fail. "warning" = edge case / imperfect but functional, passes with noted warnings. Defaults to "blocking".' },
                             },
                             required: ['id', 'name', 'description', 'type', 'status'],
                         },
@@ -303,20 +304,25 @@ const QA_OPENAI_TOOLS: OpenAI.ChatCompletionTool[] = [
         type: 'function',
         function: {
             name: 'submit_qa_verdict',
-            description: 'Submit the final QA verdict after completing all tests. This terminates the QA session. All tests in the plan must be in a terminal state (passed, failed, or skipped) before calling this.',
+            description: 'Submit the final QA verdict after completing all tests. This terminates the QA session. All tests in the plan must be in a terminal state (passed, failed, or skipped) before calling this. The verdict is auto-enforced: if any blocking test failed, passed will be forced to false. If only warning tests failed, passed will be forced to true.',
             parameters: {
                 type: 'object',
                 properties: {
-                    passed: { type: 'boolean', description: 'Overall pass/fail verdict' },
+                    passed: { type: 'boolean', description: 'Overall pass/fail verdict (will be auto-corrected based on severity of failures)' },
                     issues: {
                         type: 'array',
                         items: { type: 'string' },
-                        description: 'Specific, actionable issues found (empty array if passed)',
+                        description: 'Specific, actionable issues from BLOCKING test failures (empty array if passed)',
+                    },
+                    warnings: {
+                        type: 'array',
+                        items: { type: 'string' },
+                        description: 'Non-blocking issues from WARNING test failures — noted for future improvement but do not fail the verdict',
                     },
                     stepsToReproduce: {
                         type: 'array',
                         items: { type: 'string' },
-                        description: 'Ordered steps the SWE can follow to reproduce each issue (e.g., "1. Start backend: pnpm --filter @ai-hivemind/backend dev", "2. GET http://localhost:3001/api/posts", "3. Observe: response is empty array []"). Empty array if passed.',
+                        description: 'Ordered steps the SWE can follow to reproduce each blocking issue (e.g., "1. Start backend: pnpm --filter @ai-hivemind/backend dev", "2. GET http://localhost:3001/api/posts", "3. Observe: response is empty array []"). Empty array if passed.',
                     },
                     summary: { type: 'string', description: 'Comprehensive test report summarizing all findings' },
                 },
@@ -374,6 +380,7 @@ function buildQaSystemPrompt(
     designSpec?: UxDesignSpec,
     taskGraph?: TaskGraph,
     priorIssues?: string[],
+    arbiterGuidance?: string,
 ): string {
     const artifactSummary = [
         `Claude Code exit: ${artifact.success ? 'SUCCESS' : 'FAILED'}`,
@@ -438,6 +445,15 @@ YOUR PRIORITY: Re-test each prior issue above to verify the fix. Your test plan 
 a specific test for EACH prior issue. If the fix works, mark it passed. If not, report the
 SAME issue again (not a different variation). Do NOT invent new test categories that weren't
 in the previous run — the SWE can only fix what was reported.
+`
+        : '';
+
+    const arbiterGuidanceSection = arbiterGuidance !== undefined && arbiterGuidance !== ''
+        ? `
+ARBITER GUIDANCE (from the QA review process — follow this carefully):
+${arbiterGuidance}
+
+This guidance corrects issues from your previous QA run. Follow it precisely.
 `
         : '';
 
@@ -550,8 +566,19 @@ A page that fetches from Reddit with a 10s timeout WILL time out — that's not 
 A page showing real content that you can't find because you guessed \`.post-card\` instead of the
 actual class name — that's YOUR selector being wrong, not a code bug.
 
+### Phase 0: Discover Actual Routes (MANDATORY — do this BEFORE planning tests)
+${hasBackendFiles ? `Before writing ANY test plan, you MUST discover what HTTP routes actually exist:
+  execute_cli_command: grep -n "app\\.\\(get\\|post\\|put\\|delete\\|patch\\)" ${workDir}/apps/backend/src/server.ts
+This gives you the REAL route registrations. Your test plan MUST target ONLY routes that appear in this output.
+Do NOT assume REST conventions (e.g., don't assume GET /api/foo/:id exists just because POST /api/foo exists).
+Do NOT test endpoints that don't appear in the grep output — they will 404 and that's YOUR mistake, not a bug.
+If the SWE created a custom path like /api/foo/bar, test /api/foo/bar — not /api/foo.` : 'No backend files changed — skip route discovery.'}
+${hasFrontendFiles ? `For frontend pages, discover actual routes:
+  execute_cli_command: find ${workDir}/apps/web/src/app -name "page.tsx" -type f
+This shows you which pages actually exist in the Next.js app router.` : ''}
+
 ### Phase 1: Plan Your Tests
-Analyze the SWE artifact, acceptance criteria, ${hasDesign ? 'design spec, ' : ''}and available endpoints.
+Analyze the SWE artifact, acceptance criteria, Phase 0 route discovery results, ${hasDesign ? 'design spec, ' : ''}and available endpoints.
 Call **update_test_plan** with a comprehensive set of tests. Aim for 5-8 targeted tests covering:
 ${hasBackendFiles ? '- API endpoint probes (health check, each relevant endpoint) — use http_get' : ''}
 ${hasBackendFiles ? '- Response content validation (correct data structure, non-empty results) — use http_get' : ''}
@@ -573,9 +600,10 @@ what you expected, and what you actually got. Vague results like "it didn't work
 
 ### Phase 3: Submit Verdict
 After ALL tests are complete (no pending or running tests), call **submit_qa_verdict** with:
-- \`passed\`: true only if ALL tests passed (or non-critical ones are skipped with good reason)
-- \`issues\`: specific, actionable issues the SWE can fix (empty if passed)
-- \`stepsToReproduce\`: ordered steps the SWE can follow to reproduce each failure (empty if passed).
+- \`passed\`: true if no BLOCKING tests failed (warning-only failures still pass)
+- \`issues\`: specific, actionable issues from BLOCKING test failures only (empty if passed)
+- \`warnings\`: non-blocking issues from WARNING test failures — noted for improvement but do not fail the verdict
+- \`stepsToReproduce\`: ordered steps the SWE can follow to reproduce each BLOCKING failure (empty if passed).
   Write these as numbered CLI commands and observations so the SWE can copy-paste them to verify the fix.
 - \`summary\`: comprehensive report of everything you tested and found
 
@@ -601,9 +629,31 @@ IMPORTANT RULES:
   plus verify that specific prior issues have been fixed. NEVER introduce NEW test categories on a retry that
   weren't tested in the first run. The SWE can only fix what you reported; inventing new failures on each
   retry creates an impossible moving target.
-- Any test with \`failed\` status means the overall verdict should be \`passed: false\`
-- A page stuck on "Loading..." after browser_navigate + browser_wait_for is an AUTOMATIC FAIL
-- Unstyled HTML (raw browser defaults, no CSS) is an AUTOMATIC FAIL
+  **STABILITY EXCEPTION — WRONG ENDPOINT:** If a previous test targeted an endpoint that returned 404 or
+  "Cannot GET/POST/...", re-run Phase 0 route discovery (grep the server route file) to check whether that
+  endpoint actually exists. If it does NOT exist, you MUST replace the test with one targeting the actual
+  route discovered via grep. Note in the test result: "Corrected endpoint: was testing X, now testing Y
+  per route inspection." This is NOT introducing a new test category — it is fixing a QA mistake.
+- **SEVERITY RULE (CRITICAL):** Each test MUST have a \`severity\` field — either "blocking" or "warning".
+  Use these guidelines:
+    BLOCKING (severity: "blocking") — the feature is fundamentally broken or non-functional:
+      ✅ Endpoint returns 500 or doesn't respond at all
+      ✅ Page fails to render / stuck on "Loading..."
+      ✅ Core acceptance criterion is completely unmet (e.g. no data returned when data is required)
+      ✅ Unstyled HTML (raw browser defaults, no CSS)
+      ✅ Feature is non-functional (buttons don't work, forms don't submit)
+    WARNING (severity: "warning") — imperfect but the feature works:
+      ✅ Content filtering misses edge cases (e.g. ambiguous posts that could go either way)
+      ✅ Minor styling inconsistencies that don't break usability
+      ✅ Performance is acceptable but not optimal
+      ✅ Data is mostly correct but has occasional imperfections
+      ✅ Feature works but a rare edge case isn't handled
+  When in doubt, prefer "warning" — only use "blocking" when the feature clearly does not work.
+- **VERDICT RULE:** Only BLOCKING test failures cause \`passed: false\`. WARNING failures are noted
+  in the \`warnings\` array but the verdict can still be \`passed: true\`. The system will auto-enforce
+  this: if no blocking tests failed, the verdict is forced to pass regardless of what you submit.
+- A page stuck on "Loading..." after browser_navigate + browser_wait_for is an AUTOMATIC BLOCKING FAIL
+- Unstyled HTML (raw browser defaults, no CSS) is an AUTOMATIC BLOCKING FAIL
 - Do NOT re-run pnpm build — the SWE already verified compilation. Focus on runtime behavior.
 - **TIMEOUT RETRY RULE:** If browser_wait_for times out, consider whether you used a long enough timeout
   for the data flow. If the page fetches from an external API and you used < 45000ms, RETRY with a longer
@@ -646,16 +696,22 @@ ${hasBackendFiles && hasFrontendFiles ? `  Backend + Frontend example:
     { id: "frontend-interaction", name: "Interactive features work", type: "interaction", description: "Using discovered selectors, click/interact and verify response" },
   ]`}
 
-ISSUES FORMAT — each issue MUST be specific and actionable so the SWE can fix it:
+ISSUE FORMAT RULE (MANDATORY — issues missing required fields will be rejected):
+Every issue string MUST contain ALL FOUR of these fields:
+  1. EXACT HTTP method + full URL tested (e.g., "GET http://localhost:62361/api/credentials/abc123")
+  2. HTTP status code or error received (e.g., "returned 404", "connection refused")
+  3. Response body or first 200 chars (e.g., 'body: {"error":"Not found"}')
+  4. What you expected instead (e.g., "expected 200 with {token: string}")
+
 BAD (too vague — NEVER write issues like these):
-  - "Layout does not match wireframe"
-  - "Missing components"
-  - "Page not working correctly"
+  - "Cannot GET the stored OAuth token" ← missing URL, status, body
+  - "Layout does not match wireframe" ← no specifics
+  - "Page not working correctly" ← useless
 GOOD (specific — ALWAYS write issues like these):
   - "GET http://localhost:54372/api/posts returned HTTP 200 but body is empty array [] — expected non-empty array with title, author, score fields"
+  - "POST http://localhost:54372/api/credentials returned 400 body: {\\"error\\":\\"serviceName required\\"} — expected 201 with stored credential object"
   - "Screenshot of http://localhost:54372/doomscroll shows unstyled HTML — no Tailwind classes on main container, expected centered single-column layout"
-  - "PostCard component missing from /doomscroll — browser_get_text('.main') returns raw JSON instead of styled card content"
-Each issue must include: the URL you probed, what you expected, and what you actually found.
+Without the exact URL and status code, the SWE cannot diagnose whether the test hit the right endpoint.
 
 STEPS TO REPRODUCE — when the verdict fails, provide an ordered list the SWE can follow:
 BAD (too vague):
@@ -679,7 +735,7 @@ All CLI commands (execute_cli_command) run inside the container automatically.
 SUBTASK: ${subtask}
 
 ACCEPTANCE CRITERIA: ${acceptanceCriteria}
-${priorIssuesSection}${designSection}
+${priorIssuesSection}${arbiterGuidanceSection}${designSection}
 ${taskGraphSection}
 SWE ARTIFACT:
 ${artifactSummary}
@@ -717,7 +773,7 @@ The SWE/Claude Code agent already ran tsc and build checks. Do NOT re-run those.
 SUBTASK: ${subtask}
 
 ACCEPTANCE CRITERIA: ${acceptanceCriteria}
-${priorIssuesSection}${designSection}
+${priorIssuesSection}${arbiterGuidanceSection}${designSection}
 ${taskGraphSection}
 SWE ARTIFACT:
 ${artifactSummary}
@@ -752,6 +808,8 @@ function inferAffectedPackages(filesChanged: string[]): string[] {
 export interface QaVerdict {
     passed: boolean;
     issues: string[];
+    /** Non-blocking issues from warning-severity test failures */
+    warnings: string[];
     checksRun: string[];
     visualDescription: string;
     /** Comprehensive test report summarizing findings */
@@ -778,7 +836,7 @@ export class QaEngineer extends BaseAgent {
     #verdictSubmitted = false;
 
     /** Verdict args stored when submit_qa_verdict is called */
-    #pendingVerdict: { passed: boolean; issues: string[]; stepsToReproduce: string[]; summary: string } | null = null;
+    #pendingVerdict: { passed: boolean; issues: string[]; warnings: string[]; stepsToReproduce: string[]; summary: string } | null = null;
 
     constructor(agentId: string, traceId: string) {
         super(agentId, traceId);
@@ -793,6 +851,7 @@ export class QaEngineer extends BaseAgent {
         designSpec?: UxDesignSpec | null,
         taskGraph?: TaskGraph,
         priorIssues?: string[],
+        arbiterGuidance?: string,
     ): Promise<QaVerdict> {
         this.#sandbox = sandbox;
         this.#testPlan = null;
@@ -827,6 +886,7 @@ export class QaEngineer extends BaseAgent {
             designSpec ?? undefined,
             taskGraph,
             priorIssues,
+            arbiterGuidance,
         );
 
         const isRetry = priorIssues !== undefined && priorIssues.length > 0;
@@ -846,6 +906,7 @@ export class QaEngineer extends BaseAgent {
         let verdict: QaVerdict = {
             passed: false,
             issues: ['QaEngineer did not complete testing'],
+            warnings: [],
             checksRun: [],
             visualDescription: 'N/A',
         };
@@ -930,19 +991,20 @@ export class QaEngineer extends BaseAgent {
         } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             logger.error(`[${this.agentId}] QA loop error: `, err);
-            verdict = { passed: false, issues: [`QaEngineer error: ${msg}`], checksRun: [], visualDescription: 'N/A' };
+            verdict = { passed: false, issues: [`QaEngineer error: ${msg}`], warnings: [], checksRun: [], visualDescription: 'N/A' };
         }
 
         // Build final verdict from submitted verdict or fallback.
         // TS control-flow analysis can't track mutations via #handleSubmitVerdict()
         // (called indirectly through #dispatchTool), so it narrows #verdictSubmitted
         // to `false` and #pendingVerdict to `null`. Widen with type assertions.
-        const pv = this.#pendingVerdict as { passed: boolean; issues: string[]; stepsToReproduce: string[]; summary: string } | null;
+        const pv = this.#pendingVerdict as { passed: boolean; issues: string[]; warnings: string[]; stepsToReproduce: string[]; summary: string } | null;
         if ((this.#verdictSubmitted as boolean) && pv !== null) {
             const plan = this.#testPlan as QaTestPlan | null;
             verdict = {
                 passed: pv.passed,
                 issues: pv.issues,
+                warnings: pv.warnings ?? [],
                 checksRun: plan !== null ? plan.tests.map((t) => t.name) : [],
                 visualDescription: plan !== null
                     ? plan.tests
@@ -962,6 +1024,7 @@ export class QaEngineer extends BaseAgent {
             subtask,
             passed: verdict.passed,
             issues: verdict.issues,
+            warnings: verdict.warnings,
             checksRun: verdict.checksRun,
             visualDescription: verdict.visualDescription,
             summary: verdict.summary,
@@ -971,10 +1034,13 @@ export class QaEngineer extends BaseAgent {
             filesChanged: artifact.filesChanged.length,
         });
 
+        const warningNote = verdict.warnings.length > 0
+            ? ` (${verdict.warnings.length.toString()} warning(s))`
+            : '';
         this.emit('STATE_CHANGED', {
             message: verdict.passed
-                ? `QA PASSED ✓ — ${verdict.checksRun.length} tests run`
-                : `QA FAILED ✗ — ${verdict.issues.length} issue(s): ${verdict.issues[0] ?? ''}`,
+                ? `QA PASSED ✓ — ${verdict.checksRun.length.toString()} tests run${warningNote}`
+                : `QA FAILED ✗ — ${verdict.issues.length.toString()} issue(s): ${verdict.issues[0] ?? ''}`,
             phase: 'validate',
             passed: verdict.passed,
         });
@@ -1331,8 +1397,8 @@ export class QaEngineer extends BaseAgent {
     }
 
     #handleSubmitVerdict(args: Record<string, unknown>): string {
-        const passed = args['passed'] === true;
         const issues = Array.isArray(args['issues']) ? (args['issues'] as unknown[]).map(String) : [];
+        const warnings = Array.isArray(args['warnings']) ? (args['warnings'] as unknown[]).map(String) : [];
         const stepsToReproduce = Array.isArray(args['stepsToReproduce']) ? (args['stepsToReproduce'] as unknown[]).map(String) : [];
         const summary = typeof args['summary'] === 'string' ? args['summary'] : '';
 
@@ -1346,17 +1412,34 @@ export class QaEngineer extends BaseAgent {
             }
         }
 
+        // Auto-enforce severity model: derive pass/fail from test plan severities.
+        // Only BLOCKING failures cause a FAIL verdict. WARNING failures pass with notes.
+        let hasBlockingFailure = false;
+        if (this.#testPlan !== null) {
+            for (const t of this.#testPlan.tests) {
+                if (t.status === 'failed' && (t.severity === 'blocking' || t.severity === undefined)) {
+                    hasBlockingFailure = true;
+                    break;
+                }
+            }
+        }
+        const enforced = !hasBlockingFailure;
+        const llmPassed = args['passed'] === true;
+        if (enforced !== llmPassed) {
+            logger.info(`[${this.agentId}] Verdict auto-corrected: LLM said passed=${String(llmPassed)}, enforced passed=${String(enforced)} (blocking failures: ${String(hasBlockingFailure)})`);
+        }
+
         this.#verdictSubmitted = true;
-        this.#pendingVerdict = { passed, issues, stepsToReproduce, summary };
+        this.#pendingVerdict = { passed: enforced, issues, warnings, stepsToReproduce, summary };
 
         // Emit as TOOL_USED so the activity log shows this action
         this.emit('TOOL_USED', {
             toolName: 'submit_qa_verdict',
-            input: { passed, issueCount: issues.length },
+            input: { passed: enforced, issueCount: issues.length, warningCount: warnings.length },
             phase: 'qa',
         });
 
-        return JSON.stringify({ accepted: true, passed, issueCount: issues.length });
+        return JSON.stringify({ accepted: true, passed: enforced, issueCount: issues.length, warningCount: warnings.length });
     }
 
     #formatPlanSummary(plan: QaTestPlan): string {
@@ -1443,6 +1526,7 @@ export class QaEngineer extends BaseAgent {
                 return {
                     passed: parsed.passed === true,
                     issues: Array.isArray(parsed.issues) ? (parsed.issues as unknown[]).map(String) : [],
+                    warnings: [],
                     checksRun: Array.isArray(parsed.checksRun) ? (parsed.checksRun as unknown[]).map(String) : [],
                     visualDescription: typeof parsed.visualDescription === 'string' ? parsed.visualDescription : 'N/A',
                     ...(typeof parsed.summary === 'string' ? { summary: parsed.summary } : {}),
@@ -1466,6 +1550,7 @@ export class QaEngineer extends BaseAgent {
         return {
             passed: inferredPass,
             issues: inferredPass ? [] : [`QA wrote prose instead of JSON (inferred FAIL): ${raw.slice(0, 300)}`],
+            warnings: [],
             checksRun: ['inferred-from-prose'],
             visualDescription: raw.slice(0, 200),
             ...(fallbackPlan !== null ? { testPlan: fallbackPlan } : {}),

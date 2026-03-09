@@ -106,8 +106,10 @@ function getAvailablePort(): Promise<number> {
  *
  * The image layers are cached by Docker — subsequent builds are near-instant
  * unless package.json or pnpm-lock.yaml change.
+ *
+ * Returns a Promise so the event loop stays free for health checks during build.
  */
-export function buildSandboxImage(): void {
+export async function buildSandboxImage(): Promise<void> {
     const dockerfile = path.join(MONOREPO_ROOT, 'Dockerfile.sandbox');
     if (!fs.existsSync(dockerfile)) {
         logger.warn('[SandboxManager] Dockerfile.sandbox not found — skipping image build');
@@ -115,21 +117,39 @@ export function buildSandboxImage(): void {
     }
 
     logger.info('[SandboxManager] Building sandbox Docker image...');
-    try {
-        execSync(
-            `docker build -f Dockerfile.sandbox -t ${SANDBOX_IMAGE} .`,
-            {
-                cwd: MONOREPO_ROOT,
-                stdio: 'pipe',
-                timeout: 5 * 60 * 1000, // 5 minutes for first build
-            },
+    return new Promise<void>((resolve, reject) => {
+        const child = spawn(
+            'docker',
+            ['build', '-f', 'Dockerfile.sandbox', '-t', SANDBOX_IMAGE, '.'],
+            { cwd: MONOREPO_ROOT, stdio: 'pipe' },
         );
-        logger.info('[SandboxManager] Sandbox image built successfully');
-    } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        logger.error(`[SandboxManager] Failed to build sandbox image: ${msg}`);
-        throw new Error(`Sandbox image build failed: ${msg}`);
-    }
+
+        const timeout = setTimeout(() => {
+            child.kill('SIGTERM');
+            reject(new Error('Sandbox image build timed out after 5 minutes'));
+        }, 5 * 60 * 1000);
+
+        let stderr = '';
+        child.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+
+        child.on('close', (code) => {
+            clearTimeout(timeout);
+            if (code === 0) {
+                logger.info('[SandboxManager] Sandbox image built successfully');
+                resolve();
+            } else {
+                const msg = `docker build exited with code ${code}: ${stderr.slice(-500)}`;
+                logger.error(`[SandboxManager] Failed to build sandbox image: ${msg}`);
+                reject(new Error(`Sandbox image build failed: ${msg}`));
+            }
+        });
+
+        child.on('error', (err) => {
+            clearTimeout(timeout);
+            logger.error(`[SandboxManager] Failed to build sandbox image: ${err.message}`);
+            reject(err);
+        });
+    });
 }
 
 /**
@@ -217,7 +237,7 @@ export async function createFeatureSandbox(traceId: string): Promise<SandboxHand
     // This includes ANTHROPIC_API_KEY, OPENAI_API_KEY, and any other
     // keys stored via the Settings page. No more hard-coded env vars.
     try {
-        const credentialEnvVars = credentialStore.getDecryptedEnvVars();
+        const credentialEnvVars = credentialStore.getDecryptedEnvVars(traceId);
         for (const [envName, envValue] of Object.entries(credentialEnvVars)) {
             createArgs.push('-e', `${envName}=${envValue}`);
         }

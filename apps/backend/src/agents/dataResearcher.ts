@@ -6,6 +6,11 @@
  * (web_search, http_get, query_rag) to produce a structured ResearchResult
  * that the ProjectManager feeds into the Planner prompt.
  *
+ * When a SandboxHandle is provided, the researcher uses `ask_codebase` to
+ * delegate codebase exploration to Claude Code running inside the sandbox.
+ * This is far more effective than grep/read_file — Claude Code understands
+ * code structure and can answer architectural questions directly.
+ *
  * Tier 2 constraints:
  *  - No spawning of sub-agents
  *  - Read-only tool binding (no file writes, no shell commands)
@@ -17,6 +22,8 @@ import { logger } from '../services/logger.js';
 import { mcpRegistry } from '../services/mcpRegistry.js';
 import { executeTool } from '../services/mcpExecutor.js';
 import { ragStore } from '../services/ragStore.js';
+import { ConductorWrapper } from '../services/conductor.js';
+import type { SandboxHandle } from '../services/sandboxManager.js';
 
 import { BaseAgent } from './baseAgent.js';
 
@@ -71,30 +78,86 @@ Guidelines:
 - Do NOT write any code
 - Use 'query_rag' before any web_search — prefer cached project knowledge`;
 
+const SANDBOX_PROMPT_SUFFIX = `
+- Use 'ask_codebase' to explore the project source code. This is your MOST POWERFUL tool — it runs a full Claude Code agent inside the development sandbox that can read files, search code, trace call chains, and answer deep architectural questions.
+- Ask DEEP, COMPOUND questions — the agent is highly capable. BAD: "What routes exist?" GOOD: "Trace the full data flow from when a user submits a feature request to when the FeatureDeveloper starts executing. What files are involved, what events are emitted, and how does the task graph get created and passed between components?"
+- Each ask_codebase call is expensive (spawns a full agent session), so ask fewer but richer questions. 2-3 deep questions are better than 6 shallow ones.
+- The agent can read multiple files, grep for patterns, and synthesize answers — so ask questions that require cross-file understanding.
+- Do NOT ask simple listing questions like "What files exist in X?" — instead ask "How does X work end-to-end and what are its key extension points?"
+- Prefer ask_codebase over read_file/execute_cli_command — it understands code context much better`;
+
+const FALLBACK_PROMPT_SUFFIX = `
+- Use 'read_file' and 'execute_cli_command' to explore the actual project structure and read source files
+- Start with 'execute_cli_command' to find relevant files (e.g., find, grep, ls), then 'read_file' to inspect them
+- Only run read-only shell commands (ls, find, grep, cat, wc, head, tail) — no writes or modifications`;
+
 // ── READ-ONLY MCP tool whitelist ───────────────────────────────────────────────
 // DataResearcher may only use information-gathering tools.
 
-const READ_ONLY_TOOLS = new Set(['query_rag', 'web_search', 'http_get']);
+const READ_ONLY_TOOLS = new Set(['query_rag', 'web_search', 'http_get', 'read_file', 'execute_cli_command']);
 
-// ── Coordinator-style virtual tool for RAG ────────────────────────────────────
+// ── Virtual tools ──────────────────────────────────────────────────────────────
 
-const RESEARCHER_VIRTUAL_TOOLS: OpenAI.ChatCompletionTool[] = [
-    {
-        type: 'function',
-        function: {
-            name: 'query_rag',
-            description: 'Query the knowledge base (RAG store) for relevant prior context.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    query: { type: 'string', description: 'Search query text' },
-                    collection: { type: 'string', description: 'Collection name (default: "default")', default: 'default' },
-                },
-                required: ['query'],
+const RAG_TOOL: OpenAI.ChatCompletionTool = {
+    type: 'function',
+    function: {
+        name: 'query_rag',
+        description: 'Query the knowledge base (RAG store) for relevant prior context.',
+        parameters: {
+            type: 'object',
+            properties: {
+                query: { type: 'string', description: 'Search query text' },
+                collection: { type: 'string', description: 'Collection name (default: "default")', default: 'default' },
             },
+            required: ['query'],
         },
     },
-];
+};
+
+const ASK_CODEBASE_TOOL: OpenAI.ChatCompletionTool = {
+    type: 'function',
+    function: {
+        name: 'ask_codebase',
+        description: 'Ask a question about the project codebase. A Claude Code agent inside the sandbox will explore files, search code, and return a detailed answer. Ask specific, focused questions about architecture, file structure, implementations, or patterns.',
+        parameters: {
+            type: 'object',
+            properties: {
+                question: { type: 'string', description: 'A specific question about the codebase (e.g., "How does the FeatureDeveloper create sandboxes?", "What routes exist under apps/web/src/app/?")' },
+            },
+            required: ['question'],
+        },
+    },
+};
+
+const READ_FILE_TOOL: OpenAI.ChatCompletionTool = {
+    type: 'function',
+    function: {
+        name: 'read_file',
+        description: 'Read a file from the project codebase. Use relative paths from the monorepo root (e.g., "apps/backend/src/agents/featureDeveloper.ts").',
+        parameters: {
+            type: 'object',
+            properties: {
+                path: { type: 'string', description: 'File path relative to monorepo root' },
+            },
+            required: ['path'],
+        },
+    },
+};
+
+const CLI_TOOL: OpenAI.ChatCompletionTool = {
+    type: 'function',
+    function: {
+        name: 'execute_cli_command',
+        description: 'Run a read-only shell command to explore the project structure. Only use read-only commands: ls, find, grep, cat, wc, head, tail. Runs from the monorepo root.',
+        parameters: {
+            type: 'object',
+            properties: {
+                command: { type: 'string', description: 'Shell command to run (read-only only)' },
+            },
+            required: ['command'],
+        },
+    },
+};
 
 const MAX_TURNS = 6;
 
@@ -110,28 +173,49 @@ export interface ResearchResult {
 export class DataResearcher extends BaseAgent {
     static readonly RAG_COLLECTION = 'research-context';
 
+    /** ConductorWrapper for ask_codebase — created per research run when sandbox available */
+    #conductor: ConductorWrapper | null = null;
+    #sandbox: SandboxHandle | null = null;
+
     constructor(agentId: string, traceId: string) {
         super(agentId, traceId);
     }
 
-    async run(objective: string): Promise<ResearchResult> {
+    async run(objective: string, sandbox?: SandboxHandle): Promise<ResearchResult> {
         this.spawn('data-researcher');
         this.emit('STATE_CHANGED', {
             message: `Researching: "${objective}"`,
             phase: 'research',
         });
 
-        // Build tool set: virtual RAG tool + whitelisted MCP tools
+        // When sandbox is available, use ask_codebase for codebase exploration
+        const hasSandbox = sandbox !== undefined;
+        this.#sandbox = sandbox ?? null;
+
+        if (hasSandbox) {
+            this.#conductor = new ConductorWrapper(`${this.agentId}-swe`, this.traceId);
+        }
+
+        // Build tool set based on sandbox availability
+        const virtualTools: OpenAI.ChatCompletionTool[] = [RAG_TOOL];
+        if (hasSandbox) {
+            virtualTools.push(ASK_CODEBASE_TOOL);
+        } else {
+            virtualTools.push(READ_FILE_TOOL, CLI_TOOL);
+        }
+
         const mcpTools = mcpRegistry.getAvailableTools()
             .filter((t) => READ_ONLY_TOOLS.has(t.name))
             .map((t): OpenAI.ChatCompletionTool => ({
                 type: 'function',
                 function: { name: t.name, description: t.description, parameters: t.inputSchema },
             }));
-        const allTools = [...RESEARCHER_VIRTUAL_TOOLS, ...mcpTools];
+        const allTools = [...virtualTools, ...mcpTools];
+
+        const systemContent = RESEARCHER_SYSTEM_PROMPT + (hasSandbox ? SANDBOX_PROMPT_SUFFIX : FALLBACK_PROMPT_SUFFIX);
 
         const messages: OpenAI.ChatCompletionMessageParam[] = [
-            { role: 'system', content: RESEARCHER_SYSTEM_PROMPT },
+            { role: 'system', content: systemContent },
             { role: 'user', content: `Objective: ${objective}` },
         ];
 
@@ -193,13 +277,39 @@ export class DataResearcher extends BaseAgent {
         if (name === 'query_rag') {
             const query = String(args['query'] ?? '');
             const collection = String(args['collection'] ?? 'default');
-            const results = ragStore.queryContext(collection, query);
+            const results = await ragStore.queryContextSemantic(collection, query);
             if (results.length === 0) return 'No relevant context found.';
             return results.map((r) => `[${r.entry.tags.join(', ')}] ${r.entry.content}`).join('\n---\n');
         }
 
+        if (name === 'ask_codebase') {
+            const question = String(args['question'] ?? '');
+            if (this.#conductor === null || this.#sandbox === null) {
+                return 'ERROR: ask_codebase requires a sandbox (not available in this session).';
+            }
+            try {
+                logger.info(`[${this.agentId}] ask_codebase: "${question.slice(0, 80)}"`);
+                const answer = await this.#conductor.askQuestion(question, this.#sandbox);
+                logger.info(`[${this.agentId}] ask_codebase answer: ${answer.slice(0, 100)}...`);
+                return answer;
+            } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                logger.warn(`[${this.agentId}] ask_codebase failed: ${msg}`);
+                return `ask_codebase failed: ${msg}`;
+            }
+        }
+
         if (!READ_ONLY_TOOLS.has(name)) {
             return `Tool '${name}' is not authorized for DataResearcher.`;
+        }
+
+        // Safety: block write/destructive shell commands
+        if (name === 'execute_cli_command') {
+            const command = String(args['command'] ?? '');
+            const blocked = ['rm ', 'mv ', 'cp ', 'write', 'mkdir', 'touch', '>', '>>', 'chmod', 'chown', 'sudo'];
+            if (blocked.some((b) => command.includes(b))) {
+                return 'ERROR: Only read-only commands are allowed (ls, find, grep, cat, wc, head, tail)';
+            }
         }
 
         return await executeTool(name, args);
@@ -215,7 +325,7 @@ export class DataResearcher extends BaseAgent {
             traceId: this.traceId,
             agentId: this.agentId,
             content: `Research for: ${objective}\n\n${report}`,
-            tags: ['research', 'data-researcher'],
+            tags: ['research', 'data-researcher', 'phase:research'],
             timestamp: new Date().toISOString(),
         });
     }

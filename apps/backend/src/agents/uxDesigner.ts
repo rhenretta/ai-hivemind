@@ -275,7 +275,7 @@ export class UxDesigner extends BaseAgent {
         if (name === 'query_rag') {
             const query = String(args['query'] ?? '');
             const collection = String(args['collection'] ?? 'default');
-            const results = ragStore.queryContext(collection, query);
+            const results = await ragStore.queryContextSemantic(collection, query);
             if (results.length === 0) return 'No relevant context found.';
             return results.map((r) => `[${r.entry.tags.join(', ')}] ${r.entry.content}`).join('\n---\n');
         }
@@ -304,7 +304,7 @@ export class UxDesigner extends BaseAgent {
         const ragContext: string[] = [];
         for (const collection of ['default', 'research-context', 'ux-designs']) {
             try {
-                const results = ragStore.queryContext(collection, question);
+                const results = await ragStore.queryContextSemantic(collection, question);
                 for (const r of results) {
                     ragContext.push(`[${collection}] ${r.entry.content.slice(0, 500)}`);
                 }
@@ -389,7 +389,7 @@ export class UxDesigner extends BaseAgent {
                     } else if (fnCall.function.name === 'query_rag') {
                         const q = String(innerArgs['query'] ?? '');
                         const c = String(innerArgs['collection'] ?? 'default');
-                        const results = ragStore.queryContext(c, q);
+                        const results = await ragStore.queryContextSemantic(c, q);
                         result = results.length === 0
                             ? 'No relevant context found.'
                             : results.map((r) => r.entry.content.slice(0, 500)).join('\n---\n');
@@ -637,7 +637,7 @@ export class UxDesigner extends BaseAgent {
             traceId: this.traceId,
             agentId: this.agentId,
             content: `UX Design for: ${objective}\n\n${JSON.stringify(spec, null, 2)}`,
-            tags: ['ux-design', 'design-spec'],
+            tags: ['ux-design', 'design-spec', 'phase:design'],
             timestamp: new Date().toISOString(),
         });
     }
