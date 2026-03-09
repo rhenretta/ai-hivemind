@@ -1,5 +1,5 @@
-import { ChatView } from '@/components/chat/ChatView';
+import { SessionView } from '@/components/session/SessionView';
 
-export default function ChatPage() {
-    return <ChatView />;
+export default function SessionPage() {
+    return <SessionView />;
 }

@@ -33,6 +33,7 @@ export interface AgentNode {
 
 /** Maps agent role → human-readable display name */
 const ROLE_DISPLAY_NAMES: Record<string, string> = {
+    'feature-developer': 'Feature Developer',
     'project-manager': 'Project Manager',
     'data-researcher': 'Data Researcher',
     'site-explorer': 'Site Explorer',
@@ -48,15 +49,17 @@ const ROLE_DISPLAY_NAMES: Record<string, string> = {
  * so we use this static map to reconstruct the hierarchy.
  */
 const ROLE_PARENT_MAP: Record<string, string> = {
-    'data-researcher': 'project-manager',
-    'site-explorer': 'project-manager',
-    'ux-designer': 'project-manager',
-    'swe-agent': 'project-manager',
-    'qa-engineer': 'project-manager',
+    'data-researcher': 'feature-developer',
+    'site-explorer': 'feature-developer',
+    'ux-designer': 'feature-developer',
+    'swe-agent': 'feature-developer',
+    'qa-engineer': 'feature-developer',
+    // Legacy: support old events where agents were children of project-manager
+    'project-manager': 'feature-developer',
 };
 
 /** Roles that should be expanded by default */
-const DEFAULT_EXPANDED_ROLES = new Set(['project-manager']);
+const DEFAULT_EXPANDED_ROLES = new Set(['feature-developer', 'project-manager']);
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -66,9 +69,13 @@ function extractRole(agentId: string): string {
     return dotIdx > 0 ? agentId.slice(0, dotIdx) : agentId;
 }
 
-/** Get display name for a role */
-function getDisplayName(role: string): string {
-    return ROLE_DISPLAY_NAMES[role] ?? role;
+/** Get display name for a role, with optional depth indicator for sub-PMs */
+function getDisplayName(role: string, isSubPm = false): string {
+    const base = ROLE_DISPLAY_NAMES[role] ?? role;
+    if (role === 'project-manager' && isSubPm) {
+        return 'Sub-PM';
+    }
+    return base;
 }
 
 /** Compute stats for an agent from its events */
@@ -127,7 +134,20 @@ export function buildAgentTree(events: SystemEvent[]): AgentNode[] {
         }
     }
 
-    // 2. Create AgentNode for each unique sourceId
+    // 2. Extract explicit parentAgentId from AGENT_SPAWNED events (for hierarchical PM support)
+    const explicitParents = new Map<string, string>();
+    for (const [agentId, agentEvents] of eventsByAgent) {
+        const spawnEvent = agentEvents.find((e) => e.eventType === 'AGENT_SPAWNED');
+        if (spawnEvent === undefined) continue;
+        const parentAgentId = typeof spawnEvent.payload['parentAgentId'] === 'string'
+            ? spawnEvent.payload['parentAgentId']
+            : null;
+        if (parentAgentId !== null) {
+            explicitParents.set(agentId, parentAgentId);
+        }
+    }
+
+    // 3. Create AgentNode for each unique sourceId
     const nodeMap = new Map<string, AgentNode>();
     for (const [agentId, agentEvents] of eventsByAgent) {
         const role = extractRole(agentId);
@@ -137,22 +157,27 @@ export function buildAgentTree(events: SystemEvent[]): AgentNode[] {
         // for USER_COMMAND/USER_INTERVENTION events shown in chat, not activity)
         if (stats.visibleCount === 0 && agentEvents.length > 0) continue;
 
+        const isSubPm = role === 'project-manager' && explicitParents.has(agentId);
         nodeMap.set(agentId, {
             agentId,
             role,
-            displayName: getDisplayName(role),
+            displayName: getDisplayName(role, isSubPm),
             events: agentEvents,
             children: [],
             stats,
         });
     }
 
-    // 3. Build parent-child relationships using ROLE_PARENT_MAP
+    // 4. Build parent-child relationships
     //
-    // Build a role→agentId index for O(1) parent lookups.
+    // Priority: explicit parentAgentId from AGENT_SPAWNED payload (supports
+    // hierarchical PM spawning) → static ROLE_PARENT_MAP fallback (backward compat).
+
+    // Build a role→agentId index for static fallback (only for agents without explicit parent).
     // If multiple agents share a role (e.g., two PMs), use the earliest one.
     const roleIndex = new Map<string, string>();
     for (const agentId of nodeMap.keys()) {
+        if (explicitParents.has(agentId)) continue; // skip — has explicit parent
         const role = extractRole(agentId);
         if (!roleIndex.has(role)) {
             roleIndex.set(role, agentId);
@@ -161,17 +186,27 @@ export function buildAgentTree(events: SystemEvent[]): AgentNode[] {
 
     const childToParent = new Map<string, string>();
     for (const agentId of nodeMap.keys()) {
+        // 1. Try explicit parentAgentId from spawn event
+        const explicitParent = explicitParents.get(agentId);
+        if (explicitParent !== undefined && nodeMap.has(explicitParent)) {
+            childToParent.set(agentId, explicitParent);
+            continue;
+        }
+
+        // 2. Fallback to static ROLE_PARENT_MAP
         const role = extractRole(agentId);
         const parentRole = ROLE_PARENT_MAP[role];
-        if (parentRole === undefined) continue; // root-level agent (coordinator, user, etc.)
+        if (parentRole === undefined) continue; // root-level agent
 
+        // For agents with an explicit parent PM, find that PM's agentId
+        // Otherwise use the first PM in the role index
         const parentId = roleIndex.get(parentRole);
         if (parentId !== undefined && nodeMap.has(parentId)) {
             childToParent.set(agentId, parentId);
         }
     }
 
-    // 4. Wire up children
+    // 5. Wire up children
     for (const [childId, parentId] of childToParent) {
         const parent = nodeMap.get(parentId);
         const child = nodeMap.get(childId);
@@ -187,7 +222,7 @@ export function buildAgentTree(events: SystemEvent[]): AgentNode[] {
         );
     }
 
-    // 5. Collect root nodes (nodes that are NOT children of anyone)
+    // 6. Collect root nodes (nodes that are NOT children of anyone)
     const childIds = new Set(childToParent.keys());
     const roots: AgentNode[] = [];
     for (const [agentId, node] of nodeMap) {

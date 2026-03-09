@@ -13,6 +13,11 @@ export interface ClarificationData {
     response?: string;
 }
 
+export interface ContextSource {
+    tool: string;
+    summary: string;
+}
+
 export interface ChatMessage {
     id: string;
     role: 'user' | 'ai';
@@ -23,61 +28,113 @@ export interface ChatMessage {
     proposal?: FeatureProposal;
     clarification?: ClarificationData;
     previewUrl?: string;
+    /** Context sources gathered by the context agent for this dialogue response */
+    contextSources?: ContextSource[];
 }
 
-const CHAT_CLEARED_AT_KEY = 'ai-hivemind:chatClearedAt';
-
 interface ChatState {
-    messages: ChatMessage[];
+    /** Messages keyed by sessionId (traceId). */
+    messagesBySession: Record<string, ChatMessage[]>;
     isAiTyping: boolean;
-    /** ISO timestamp — events before this are hidden after a clear */
-    chatClearedAt: string | null;
 
     appendMessage: (msg: ChatMessage) => void;
     updateMessage: (id: string, patch: Partial<ChatMessage>) => void;
     setAiTyping: (typing: boolean) => void;
     loadHistory: (messages: ChatMessage[]) => void;
-    clearMessages: () => void;
-}
-
-function loadClearedAt(): string | null {
-    if (typeof window === 'undefined') return null;
-    return localStorage.getItem(CHAT_CLEARED_AT_KEY);
+    clearSessionMessages: (sessionId: string) => void;
+    clearAllMessages: () => void;
 }
 
 export const useChatStore = create<ChatState>()((set) => ({
-    messages: [],
+    messagesBySession: {},
     isAiTyping: false,
-    chatClearedAt: loadClearedAt(),
 
     appendMessage: (msg) =>
         set((state) => {
+            const sessionId = msg.traceId ?? '__global__';
+            const existing = state.messagesBySession[sessionId] ?? [];
+
             // Deduplicate: skip if a message with the same id already exists
-            if (state.messages.some((m) => m.id === msg.id)) return state;
-            // Skip messages from before the chat was cleared
-            if (state.chatClearedAt !== null && msg.timestamp <= state.chatClearedAt) return state;
-            return { messages: [...state.messages, msg] };
+            if (existing.some((m) => m.id === msg.id)) return state;
+
+            return {
+                messagesBySession: {
+                    ...state.messagesBySession,
+                    [sessionId]: [...existing, msg],
+                },
+            };
         }),
 
     updateMessage: (id, patch) =>
-        set((state) => ({
-            messages: state.messages.map((m) =>
-                m.id === id ? { ...m, ...patch } : m,
-            ),
-        })),
+        set((state) => {
+            const updated: Record<string, ChatMessage[]> = {};
+            let changed = false;
+
+            for (const [sessionId, messages] of Object.entries(state.messagesBySession)) {
+                const idx = messages.findIndex((m) => m.id === id);
+                if (idx >= 0) {
+                    const newMessages = [...messages];
+                    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- idx from findIndex >= 0
+                    const oldMsg = newMessages[idx]!;
+                    const newMsg = { ...oldMsg, ...patch };
+                    newMessages[idx] = newMsg;
+
+                    // If traceId changed (intent:resolved linking), move message to correct session
+                    const newSessionId = newMsg.traceId ?? '__global__';
+                    if (newSessionId !== sessionId) {
+                        // Remove from current session
+                        updated[sessionId] = newMessages.filter((_, i) => i !== idx);
+                        // Add to target session
+                        const target = state.messagesBySession[newSessionId] ?? [];
+                        updated[newSessionId] = [...target, newMsg];
+                    } else {
+                        updated[sessionId] = newMessages;
+                    }
+                    changed = true;
+                } else {
+                    updated[sessionId] = messages;
+                }
+            }
+
+            return changed ? { messagesBySession: updated } : state;
+        }),
 
     setAiTyping: (isAiTyping) => set({ isAiTyping }),
 
-    loadHistory: (messages) => set({ messages }),
-
-    clearMessages: () => {
-        const clearedAt = new Date().toISOString();
-        if (typeof window !== 'undefined') {
-            localStorage.setItem(CHAT_CLEARED_AT_KEY, clearedAt);
+    loadHistory: (messages) => {
+        // Reconstruct per-session map from flat list
+        const bySession: Record<string, ChatMessage[]> = {};
+        for (const msg of messages) {
+            const sessionId = msg.traceId ?? '__global__';
+            if (bySession[sessionId] === undefined) bySession[sessionId] = [];
+            bySession[sessionId].push(msg);
         }
-        return set({ messages: [], isAiTyping: false, chatClearedAt: clearedAt });
+        return set({ messagesBySession: bySession });
     },
+
+    clearSessionMessages: (sessionId) =>
+        set((state) => {
+            const { [sessionId]: _, ...remaining } = state.messagesBySession;
+            return { messagesBySession: remaining };
+        }),
+
+    clearAllMessages: () =>
+        set({ messagesBySession: {}, isAiTyping: false }),
 }));
 
-export const selectMessages = (s: ChatState) => s.messages;
+// ── Selectors ────────────────────────────────────────────────────────────────
+
+const EMPTY_MESSAGES: ChatMessage[] = [];
+
+/**
+ * Get messages for a specific session.
+ * Returns a stable empty array when no messages exist (SSR-safe).
+ */
+export function selectSessionMessages(sessionId: string | null) {
+    return (s: ChatState): ChatMessage[] => {
+        if (sessionId === null) return EMPTY_MESSAGES;
+        return s.messagesBySession[sessionId] ?? EMPTY_MESSAGES;
+    };
+}
+
 export const selectIsAiTyping = (s: ChatState) => s.isAiTyping;

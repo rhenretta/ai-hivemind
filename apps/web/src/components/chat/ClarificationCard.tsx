@@ -6,7 +6,7 @@ import { v4 as uuid } from 'uuid';
 
 import { getSocket } from '@/hooks/useSocket';
 import { useChatStore, type ClarificationData } from '@/stores/chatStore';
-import { useFeatureStore } from '@/stores/featureStore';
+import { useSessionStore } from '@/stores/sessionStore';
 
 interface ClarificationCardProps {
     messageId: string;
@@ -18,7 +18,7 @@ export function ClarificationCard({ messageId, traceId, clarification }: Clarifi
     const [response, setResponse] = useState('');
     const updateMessage = useChatStore((s) => s.updateMessage);
     const appendMessage = useChatStore((s) => s.appendMessage);
-    const clearFeatureNeedsInput = useFeatureStore((s) => s.clearFeatureNeedsInput);
+    const clearSessionNeedsInput = useSessionStore((s) => s.clearSessionNeedsInput);
 
     const handleSubmit = useCallback(() => {
         if (response.trim() === '') return;
@@ -34,7 +34,7 @@ export function ClarificationCard({ messageId, traceId, clarification }: Clarifi
             traceId,
             type: 'text',
         });
-        clearFeatureNeedsInput(traceId);
+        clearSessionNeedsInput(traceId);
         useChatStore.getState().setAiTyping(true);
 
         const ws = getSocket();
@@ -45,7 +45,7 @@ export function ClarificationCard({ messageId, traceId, clarification }: Clarifi
         });
 
         setResponse('');
-    }, [response, messageId, traceId, clarification, updateMessage, appendMessage, clearFeatureNeedsInput]);
+    }, [response, messageId, traceId, clarification, updateMessage, appendMessage, clearSessionNeedsInput]);
 
     if (clarification.responded) {
         return (

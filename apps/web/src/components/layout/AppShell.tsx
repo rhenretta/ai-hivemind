@@ -2,7 +2,7 @@
 
 import { type ReactNode } from 'react';
 
-import { NavBar } from './NavBar';
+import { SessionSidebar } from './SessionSidebar';
 
 interface AppShellProps {
     children: ReactNode;
@@ -11,7 +11,7 @@ interface AppShellProps {
 export function AppShell({ children }: AppShellProps) {
     return (
         <div className="flex h-screen overflow-hidden">
-            <NavBar />
+            <SessionSidebar />
             <main className="flex-1 overflow-hidden">
                 {children}
             </main>

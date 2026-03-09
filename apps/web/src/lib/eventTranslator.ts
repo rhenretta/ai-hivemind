@@ -202,6 +202,19 @@ export function translateEvent(event: SystemEvent): string | null {
             return `Problem: ${message}`;
         }
 
+        case 'QA_ARBITER_DECISION': {
+            const decision = payload['decision'] as string | undefined;
+            if (decision === 'retry') return 'Reviewing QA results, retrying...';
+            if (decision === 'ask_user') {
+                const q = typeof payload['userQuestion'] === 'string'
+                    ? payload['userQuestion']
+                    : 'Needs clarification';
+                return `QA needs your input: ${q}`;
+            }
+            if (decision === 'accept') return 'QA issues reviewed — accepting implementation';
+            return 'QA arbiter made a decision';
+        }
+
         // Hidden events — return null
         case 'MESSAGE_SENT':
         case 'CONDUCTOR_STREAM':
@@ -212,6 +225,8 @@ export function translateEvent(event: SystemEvent): string | null {
         case 'CREDENTIAL_STORED':
         case 'CREDENTIAL_DELETED':
         case 'SANDBOX_LOG':
+        case 'SESSION_CREATED':
+        case 'SESSION_UPDATED':
             return null;
 
         default:
@@ -233,6 +248,8 @@ export function getActivityType(event: SystemEvent): 'info' | 'progress' | 'succ
             return event.payload['status'] === 'done' ? 'success' : 'error';
         case 'AGENT_INPUT_REQUIRED':
             return 'question';
+        case 'QA_ARBITER_DECISION':
+            return event.payload['decision'] === 'ask_user' ? 'question' : 'info';
         case 'ERROR':
             return 'error';
         case 'TOOL_USED':

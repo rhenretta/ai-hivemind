@@ -6,7 +6,7 @@ import { v4 as uuid } from 'uuid';
 
 import { getSocket } from '@/hooks/useSocket';
 import { useChatStore, type FeatureProposal } from '@/stores/chatStore';
-import { useFeatureStore } from '@/stores/featureStore';
+import { useSessionStore } from '@/stores/sessionStore';
 
 interface FeatureProposalCardProps {
     messageId: string;
@@ -17,7 +17,7 @@ interface FeatureProposalCardProps {
 export function FeatureProposalCard({ messageId, traceId, proposal }: FeatureProposalCardProps) {
     const updateMessage = useChatStore((s) => s.updateMessage);
     const appendMessage = useChatStore((s) => s.appendMessage);
-    const updateFeatureStatus = useFeatureStore((s) => s.updateFeatureStatus);
+    const updateSessionStatus = useSessionStore((s) => s.updateSessionStatus);
 
     const handleApprove = useCallback(() => {
         updateMessage(messageId, {
@@ -31,7 +31,7 @@ export function FeatureProposalCard({ messageId, traceId, proposal }: FeaturePro
             traceId,
             type: 'text',
         });
-        updateFeatureStatus(traceId, 'in_progress');
+        updateSessionStatus(traceId, 'active');
         useChatStore.getState().setAiTyping(true);
 
         const ws = getSocket();
@@ -40,7 +40,7 @@ export function FeatureProposalCard({ messageId, traceId, proposal }: FeaturePro
             targetId: 'project-manager',
             traceId,
         });
-    }, [messageId, traceId, proposal, updateMessage, appendMessage, updateFeatureStatus]);
+    }, [messageId, traceId, proposal, updateMessage, appendMessage, updateSessionStatus]);
 
     const isApproved = proposal.status === 'approved';
 

@@ -3,11 +3,10 @@
 /**
  * useSocket — Socket.io connection singleton and event router
  *
- * Replaces the old useSwarmSocket hook. Routes WebSocket events to the
- * new decomposed stores (connectionStore, chatStore, featureStore, etc.)
- * instead of the monolithic swarmStore.
+ * Routes WebSocket events to the decomposed stores (connectionStore,
+ * chatStore, sessionStore, etc.)
  *
- * Architecture rules (carried forward):
+ * Architecture rules:
  *  1. Socket is MODULE-LEVEL singleton. Created once, reused forever.
  *  2. This hook is called ONCE from SocketProvider at the app root.
  *  3. Named handler refs for StrictMode safety.
@@ -17,7 +16,7 @@
 /* eslint-disable @typescript-eslint/no-unsafe-call */
 /* eslint-disable @typescript-eslint/no-unsafe-member-access */
 
-import { type SystemEvent } from '@ai-hivemind/shared';
+import { type SystemEvent, type Session } from '@ai-hivemind/shared';
 import { useEffect } from 'react';
 import { io } from 'socket.io-client';
 import { v4 as uuid } from 'uuid';
@@ -25,8 +24,8 @@ import { v4 as uuid } from 'uuid';
 import { useChatStore } from '@/stores/chatStore';
 import { useConnectionStore } from '@/stores/connectionStore';
 import { useEventStore } from '@/stores/eventStore';
-import { useFeatureStore } from '@/stores/featureStore';
 import { useNotificationStore } from '@/stores/notificationStore';
+import { useSessionStore } from '@/stores/sessionStore';
 
 const NERVE_CENTER_URL =
     process.env['NEXT_PUBLIC_NERVE_CENTER_URL'] ?? 'http://localhost:3001';
@@ -53,7 +52,7 @@ export function getSocket(): ReturnType<typeof io> {
 function routeEvent(event: SystemEvent): void {
     const { appendEvent } = useEventStore.getState();
     const chatStore = useChatStore.getState();
-    const featureStore = useFeatureStore.getState();
+    const sessionStore = useSessionStore.getState();
     const notificationStore = useNotificationStore.getState();
 
     // Always store raw event
@@ -64,12 +63,8 @@ function routeEvent(event: SystemEvent): void {
 
     switch (event.eventType) {
         case 'USER_COMMAND': {
-            const existing = featureStore.features[traceId];
-
             // Reconstruct user chat message from the ledger event
-            // (ChatInput adds these optimistically, but they're lost on page reload)
-            // Skip when sourceId is 'dialogue-agent' — these are internal work triggers,
-            // not actual user messages.
+            // Skip when sourceId is 'dialogue-agent' — internal work triggers
             if (event.sourceId !== 'dialogue-agent') {
                 const userText = typeof event.payload['originalText'] === 'string'
                     ? event.payload['originalText']
@@ -88,56 +83,62 @@ function routeEvent(event: SystemEvent): void {
                 }
             }
 
-            if (event.sourceId === 'dialogue-agent' && existing !== undefined) {
-                // Work trigger from dialogue agent — update status to in_progress
-                featureStore.updateFeatureStatus(traceId, 'in_progress');
-            } else if (existing === undefined) {
-                // New feature — use originalText (if available) for a clean title
-                const title = typeof event.payload['originalText'] === 'string'
-                    ? event.payload['originalText']
-                    : typeof event.payload['objective'] === 'string'
-                        ? event.payload['objective']
-                        : 'New feature';
-                featureStore.upsertFeature({
-                    id: traceId,
-                    title,
-                    description: '',
-                    status: 'in_progress',
-                    createdAt: event.timestamp,
-                    updatedAt: event.timestamp,
-                    stepsTotal: 0,
-                    stepsComplete: 0,
-                });
+            // Session creation is handled by SESSION_CREATED events.
+            // Just update status for work triggers from dialogue agent.
+            if (event.sourceId === 'dialogue-agent') {
+                const existing = sessionStore.sessions[traceId];
+                if (existing !== undefined) {
+                    sessionStore.updateSessionStatus(traceId, 'active');
+                }
+            }
+            break;
+        }
+
+        case 'SESSION_CREATED': {
+            const session = event.payload as unknown as Session;
+            sessionStore.upsertSession(session);
+            break;
+        }
+
+        case 'SESSION_UPDATED': {
+            const payload = event.payload;
+            const id = typeof payload['id'] === 'string' ? payload['id'] : traceId;
+            const existing = sessionStore.sessions[id];
+            if (existing !== undefined) {
+                const patch: Partial<Session> = {};
+                if (typeof payload['title'] === 'string') patch.title = payload['title'];
+                if (typeof payload['status'] === 'string') patch.status = payload['status'] as Session['status'];
+                if (typeof payload['updatedAt'] === 'string') patch.updatedAt = payload['updatedAt'];
+                sessionStore.upsertSession({ ...existing, ...patch });
             }
             break;
         }
 
         case 'STATE_CHANGED': {
             if (event.payload['awaitingApproval'] === true) {
-                // Update feature card status only — no chat message
-                // (the DialogueAgent handles conversation, not proposals)
-                featureStore.updateFeatureStatus(traceId, 'proposal');
+                sessionStore.updateSessionStatus(traceId, 'planning');
                 chatStore.setAiTyping(false);
             } else if (event.payload['taskComplete'] === true) {
-                const message = typeof event.payload['message'] === 'string'
-                    ? event.payload['message']
-                    : 'This feature is complete!';
-                chatStore.appendMessage({
-                    id: uuid(),
-                    role: 'ai',
-                    text: message,
-                    timestamp: event.timestamp,
-                    traceId,
-                    type: 'text',
-                });
-                featureStore.updateFeatureStatus(traceId, 'completed');
+                sessionStore.updateSessionStatus(traceId, 'completed');
                 chatStore.setAiTyping(false);
 
-                const feature = featureStore.features[traceId];
+                const session = sessionStore.sessions[traceId];
+                if (session?.previewUrl !== undefined) {
+                    chatStore.appendMessage({
+                        id: uuid(),
+                        role: 'ai',
+                        text: 'Your feature is ready to test!',
+                        timestamp: event.timestamp,
+                        traceId,
+                        type: 'preview',
+                        previewUrl: session.previewUrl,
+                    });
+                }
+
                 notificationStore.addNotification({
                     id: uuid(),
                     featureId: traceId,
-                    featureTitle: feature?.title ?? 'Feature',
+                    featureTitle: session?.title ?? 'Session',
                     type: 'ready',
                     message: 'Ready to check out!',
                     timestamp: event.timestamp,
@@ -148,21 +149,51 @@ function routeEvent(event: SystemEvent): void {
         }
 
         case 'TASK_GRAPH_UPDATED': {
+            if (event.payload['isRootGraph'] === false) break;
+
+            interface GraphNode { status: string; objective?: string; subGraph?: { nodes: GraphNode[] } }
             const graph = event.payload['graph'] as {
-                nodes?: { status: string; objective?: string }[];
+                nodes?: GraphNode[];
             } | undefined;
 
             if (graph?.nodes !== undefined) {
-                const done = graph.nodes.filter((n) => n.status === 'done').length;
-                const total = graph.nodes.length;
-                const active = graph.nodes.find((n) => n.status === 'active');
-                featureStore.updateFeatureProgress(
+                const countLeaves = (nodes: GraphNode[]): { total: number; done: number } => {
+                    let total = 0;
+                    let done = 0;
+                    for (const n of nodes) {
+                        if (n.subGraph?.nodes !== undefined && n.subGraph.nodes.length > 0) {
+                            const sub = countLeaves(n.subGraph.nodes);
+                            total += sub.total;
+                            done += sub.done;
+                        } else {
+                            total++;
+                            if (n.status === 'done') done++;
+                        }
+                    }
+                    return { total, done };
+                };
+
+                const findActiveLeaf = (nodes: GraphNode[]): GraphNode | undefined => {
+                    for (const n of nodes) {
+                        if (n.subGraph?.nodes !== undefined && n.subGraph.nodes.length > 0) {
+                            const active = findActiveLeaf(n.subGraph.nodes);
+                            if (active !== undefined) return active;
+                        } else if (n.status === 'active') {
+                            return n;
+                        }
+                    }
+                    return undefined;
+                };
+
+                const { total, done } = countLeaves(graph.nodes);
+                const active = findActiveLeaf(graph.nodes);
+                sessionStore.updateSessionProgress(
                     traceId,
                     done,
                     total,
                     typeof active?.objective === 'string' ? active.objective : undefined,
                 );
-                featureStore.updateFeatureStatus(traceId, 'in_progress');
+                sessionStore.updateSessionStatus(traceId, 'active');
             }
             break;
         }
@@ -170,11 +201,11 @@ function routeEvent(event: SystemEvent): void {
         case 'TASK_NODE_COMPLETED': {
             const status = event.payload['status'] as string | undefined;
             if (status === 'failed') {
-                const feature = featureStore.features[traceId];
+                const session = sessionStore.sessions[traceId];
                 notificationStore.addNotification({
                     id: uuid(),
                     featureId: traceId,
-                    featureTitle: feature?.title ?? 'Feature',
+                    featureTitle: session?.title ?? 'Session',
                     type: 'failed',
                     message: 'A step ran into a problem',
                     timestamp: event.timestamp,
@@ -185,9 +216,7 @@ function routeEvent(event: SystemEvent): void {
         }
 
         case 'QA_VERDICT': {
-            if (event.payload['passed'] !== true) {
-                featureStore.updateFeatureStatus(traceId, 'qa_in_progress');
-            }
+            // QA events — no session status change needed
             break;
         }
 
@@ -198,7 +227,7 @@ function routeEvent(event: SystemEvent): void {
                     ? event.payload['text']
                     : 'The AI has a question for you';
 
-            featureStore.setFeatureNeedsInput(traceId, question, event.eventId);
+            sessionStore.setSessionNeedsInput(traceId, question, event.eventId);
 
             chatStore.appendMessage({
                 id: uuid(),
@@ -210,11 +239,11 @@ function routeEvent(event: SystemEvent): void {
                 clarification: { question, responded: false },
             });
 
-            const feature = featureStore.features[traceId];
+            const session = sessionStore.sessions[traceId];
             notificationStore.addNotification({
                 id: uuid(),
                 featureId: traceId,
-                featureTitle: feature?.title ?? 'Feature',
+                featureTitle: session?.title ?? 'Session',
                 type: 'needs_input',
                 message: question,
                 timestamp: event.timestamp,
@@ -228,16 +257,7 @@ function routeEvent(event: SystemEvent): void {
         case 'SERVICE_DEPLOYED': {
             const url = typeof event.payload['url'] === 'string' ? event.payload['url'] : '';
             if (url !== '') {
-                featureStore.setFeaturePreview(traceId, url);
-                chatStore.appendMessage({
-                    id: uuid(),
-                    role: 'ai',
-                    text: 'Your feature has a preview ready!',
-                    timestamp: event.timestamp,
-                    traceId,
-                    type: 'preview',
-                    previewUrl: url,
-                });
+                sessionStore.setSessionPreview(traceId, url);
             }
             break;
         }
@@ -245,9 +265,9 @@ function routeEvent(event: SystemEvent): void {
         case 'FEATURE_DEPLOYED': {
             const routes = Array.isArray(event.payload['routes']) ? event.payload['routes'] as string[] : [];
             const route = routes[0];
-            featureStore.setFeatureDeployed(traceId, route);
+            sessionStore.updateSessionStatus(traceId, 'completed');
 
-            const feature = featureStore.features[traceId];
+            const session = sessionStore.sessions[traceId];
             chatStore.appendMessage({
                 id: uuid(),
                 role: 'ai',
@@ -259,7 +279,7 @@ function routeEvent(event: SystemEvent): void {
             notificationStore.addNotification({
                 id: uuid(),
                 featureId: traceId,
-                featureTitle: feature?.title ?? 'Feature',
+                featureTitle: session?.title ?? 'Session',
                 type: 'ready',
                 message: 'Feature is now live!',
                 timestamp: event.timestamp,
@@ -269,7 +289,6 @@ function routeEvent(event: SystemEvent): void {
         }
 
         case 'USER_INTERVENTION': {
-            // Reconstruct user intervention messages (approval, clarification responses)
             const interventionText = typeof event.payload['text'] === 'string'
                 ? event.payload['text']
                 : null;
@@ -291,6 +310,10 @@ function routeEvent(event: SystemEvent): void {
                 ? event.payload['text']
                 : 'The AI responded';
 
+            const contextSources = Array.isArray(event.payload['contextSources'])
+                ? event.payload['contextSources'] as { tool: string; summary: string }[]
+                : undefined;
+
             chatStore.appendMessage({
                 id: uuid(),
                 role: 'ai',
@@ -298,36 +321,49 @@ function routeEvent(event: SystemEvent): void {
                 timestamp: event.timestamp,
                 traceId,
                 type: 'dialogue',
+                ...(contextSources !== undefined && contextSources.length > 0
+                    ? { contextSources }
+                    : {}),
             });
             chatStore.setAiTyping(false);
 
-            // During the exploring phase (before work starts), show "Thinking About It"
-            // instead of "Building" on the feature card
             const phase = typeof event.payload['conversationPhase'] === 'string'
                 ? event.payload['conversationPhase']
                 : 'exploring';
             if (phase === 'exploring') {
-                featureStore.updateFeatureStatus(traceId, 'proposal');
+                sessionStore.updateSessionStatus(traceId, 'exploring');
             }
             break;
         }
 
         case 'FEATURE_DELETED': {
-            featureStore.deleteFeature(traceId);
+            sessionStore.deleteSession(traceId);
             break;
         }
 
         case 'ERROR': {
-            // Update feature card status only — no chat message
-            // (user only wants to know when features are ready)
-            featureStore.updateFeatureStatus(traceId, 'failed');
+            sessionStore.updateSessionStatus(traceId, 'failed');
             chatStore.setAiTyping(false);
             break;
         }
 
-        // These events are stored in eventStore but not surfaced in chat
         default:
             break;
+    }
+}
+
+/**
+ * Fetch sessions from the REST API to hydrate the store.
+ */
+async function fetchSessions(): Promise<void> {
+    try {
+        const res = await fetch(`${NERVE_CENTER_URL}/api/sessions`);
+        if (res.ok) {
+            const sessions = await res.json() as Session[];
+            useSessionStore.getState().hydrateSessions(sessions);
+        }
+    } catch {
+        // Non-fatal — sessions will be populated via real-time events
     }
 }
 
@@ -342,19 +378,21 @@ export function useSocket(): void {
         const { setStatus } = useConnectionStore.getState();
         const { bulkLoad } = useEventStore.getState();
 
+        // Hydrate sessions from REST API
+        void fetchSessions();
+
         const onConnect = (): void => { setStatus('connected'); };
         const onDisconnect = (): void => { setStatus('disconnected'); };
         const onReconnectAttempt = (): void => { setStatus('reconnecting'); };
-        const onReconnect = (): void => { setStatus('connected'); };
+        const onReconnect = (): void => {
+            setStatus('connected');
+            void fetchSessions();
+        };
         const onReconnectFailed = (): void => { setStatus('disconnected'); };
         const onSystemEvent = (event: SystemEvent): void => { routeEvent(event); };
         const onSystemReplay = (events: SystemEvent[]): void => {
             bulkLoad(events);
-            // Clear chat messages before replay — they'll be reconstructed by routeEvent
-            // This prevents duplicates on reconnect (where old in-memory messages
-            // would overlap with replayed events).
-            useChatStore.getState().loadHistory([]);
-            // Replay events through router for store hydration
+            useChatStore.getState().clearAllMessages();
             for (const event of events) {
                 routeEvent(event);
             }
@@ -366,27 +404,15 @@ export function useSocket(): void {
             reasoning: string;
         }): void => {
             const chatState = useChatStore.getState();
-            const featureState = useFeatureStore.getState();
+            const sessionState = useSessionStore.getState();
 
             // Link the optimistic chat message to the resolved traceId
             chatState.updateMessage(data.clientEventId, { traceId: data.traceId });
 
             if (data.intent === 'new_feature') {
-                // Create feature entry (continue/provide_input features already exist)
-                const msg = chatState.messages.find((m) => m.id === data.clientEventId);
-                featureState.upsertFeature({
-                    id: data.traceId,
-                    title: msg?.text ?? 'New feature',
-                    description: '',
-                    status: 'in_progress',
-                    createdAt: new Date().toISOString(),
-                    updatedAt: new Date().toISOString(),
-                    stepsTotal: 0,
-                    stepsComplete: 0,
-                });
+                // Auto-select the new session
+                sessionState.setActiveSession(data.traceId);
             }
-            // No acknowledgment message for continue/provide_input —
-            // the DialogueAgent's DIALOGUE_RESPONSE handles conversation
         };
 
         ws.on('connect', onConnect);

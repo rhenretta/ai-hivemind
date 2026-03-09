@@ -1,5 +1,5 @@
-import { FeatureBoard } from '@/components/features/FeatureBoard';
+import { redirect } from 'next/navigation';
 
 export default function FeaturesPage() {
-    return <FeatureBoard />;
+    redirect('/');
 }
