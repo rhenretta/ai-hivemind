@@ -10,7 +10,7 @@ import { z } from 'zod';
  * These types cross the apps/backend → apps/web boundary (MEMORY_STORED events
  * carry a MemoryEntry in their payload) and must live in packages/shared.
  *
- * @version 0.5.0 — Added collectionName to MemoryEntry; added RagCollection schema
+ * @version 0.6.0 — Added relatedMemoryIds, taskNodeId to MemoryEntry for cross-collection linking
  */
 
 // ─── RagCollection ────────────────────────────────────────────────────────────
@@ -62,6 +62,18 @@ export const MemoryEntrySchema = z.object({
 
     /** ISO 8601 UTC timestamp of when the memory was stored. */
     timestamp: z.string().datetime(),
+
+    /**
+     * IDs of related MemoryEntries across any collection.
+     * Enables explicit cross-collection linking (e.g. research → SWE → QA chain).
+     */
+    relatedMemoryIds: z.array(z.string().uuid()).optional().default([]),
+
+    /**
+     * TaskGraph node ID this memory is associated with.
+     * Links memory entries back to the task that prompted their creation.
+     */
+    taskNodeId: z.string().optional(),
 });
 export type MemoryEntry = z.infer<typeof MemoryEntrySchema>;
 

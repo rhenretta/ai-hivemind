@@ -43,3 +43,6 @@ export * from './types/uxDesign.js';
 
 // ─── QA Test Plan ───────────────────────────────────────────────────────────
 export * from './types/qaTestPlan.js';
+
+// ─── Session ─────────────────────────────────────────────────────────────────
+export * from './types/session.js';

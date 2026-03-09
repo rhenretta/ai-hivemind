@@ -118,6 +118,21 @@ export const SystemEventTypeSchema = z.enum([
      * Payload: { newNodes?: TaskNode[], updatedNodes?: { nodeId: string, objective?: string, acceptanceCriteria?: string }[] }
      */
     'DIALOGUE_UPDATE_PLAN',
+    /**
+     * QA arbiter evaluated the attempt history and made a routing decision.
+     * Payload: QaArbiterDecision — { decision, reasoning, sweFeedback?, qaGuidance?, updatedAcceptanceCriteria?, userQuestion? }
+     */
+    'QA_ARBITER_DECISION',
+    /**
+     * A new session was created (persisted to sessionStore).
+     * Payload: Session (id, title, status, repoConfig, projectProfile, timestamps)
+     */
+    'SESSION_CREATED',
+    /**
+     * A session was updated (status change, profile detected, etc.).
+     * Payload: Partial<Session> with at least { id }
+     */
+    'SESSION_UPDATED',
 ]);
 export type SystemEventType = z.infer<typeof SystemEventTypeSchema>;
 
