@@ -9,7 +9,7 @@ import { Server, type Socket } from 'socket.io';
 import { eventBus } from './eventBus.js';
 // Services — import triggers singleton creation + built-in tool seeding
 import { credentialStore } from './services/credentialStore.js';
-import { getOrCreateDialogueAgent, getMostRecentActiveAgent } from './services/dialogueAgent.js';
+import { getOrCreateDialogueAgent, getMostRecentActiveAgent, destroyDialogueAgent } from './services/dialogueAgent.js';
 import { classifyIntent, getFeatureSummaries, getRecentChatMessages } from './services/intentRouter.js';
 import { logger } from './services/logger.js';
 import { mcpRegistry } from './services/mcpRegistry.js';
@@ -346,6 +346,8 @@ app.patch('/api/sessions/:id', (req: Request, res: Response) => {
 /** Delete a session. */
 app.delete('/api/sessions/:id', (req: Request, res: Response) => {
     const { id } = req.params as { id: string };
+    // Clean up DialogueAgent (stops FeatureDeveloper, removes subscriptions)
+    destroyDialogueAgent(id);
     // Destroy sandbox if one exists
     try {
         destroyFeatureSandbox(id);
@@ -679,6 +681,9 @@ io.on('connection', (socket: Socket) => {
     const handleDeleteSession = (data: { traceId: string }) => {
         const { traceId } = data;
         logger.info(`[Nerve Center] user:delete-session from socket=${socket.id} | traceId=${traceId}`);
+
+        // Clean up DialogueAgent (stops FeatureDeveloper, removes subscriptions)
+        destroyDialogueAgent(traceId);
 
         // Destroy sandbox if one exists
         try {

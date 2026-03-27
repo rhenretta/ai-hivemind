@@ -49,6 +49,7 @@ export function SessionSidebar() {
     const sessionsMap = useSessionStore(selectSessions);
     const activeSessionId = useSessionStore((s) => s.activeSessionId);
     const setActiveSession = useSessionStore((s) => s.setActiveSession);
+    const deleteSession = useSessionStore((s) => s.deleteSession);
 
     // Derive sorted list + group from stable sessions record
     const sessions = useMemo(
@@ -80,10 +81,12 @@ export function SessionSidebar() {
     const handleDeleteSession = useCallback(
         (e: React.MouseEvent, id: string) => {
             e.stopPropagation();
+            // Optimistic UI update — remove immediately
+            deleteSession(id);
             const ws = getSocket();
             ws.emit('user:delete-session', { traceId: id });
         },
-        [],
+        [deleteSession],
     );
 
     return (

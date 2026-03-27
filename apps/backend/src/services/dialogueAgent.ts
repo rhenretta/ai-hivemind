@@ -66,6 +66,19 @@ export function getDialogueAgent(traceId: string): DialogueAgent | undefined {
 }
 
 /**
+ * Destroy a DialogueAgent instance on session deletion.
+ * Cleans up event subscriptions and removes from the registry.
+ */
+export function destroyDialogueAgent(traceId: string): void {
+    const agent = dialogueAgents.get(traceId);
+    if (agent !== undefined) {
+        agent.destroy();
+        dialogueAgents.delete(traceId);
+        logger.info(`[DialogueAgent:${traceId}] Destroyed and removed from registry`);
+    }
+}
+
+/**
  * Find the most recently active DialogueAgent.
  * Used by the message router to detect when a follow-up message belongs
  * to an ongoing conversation rather than being a new feature request.
@@ -111,7 +124,7 @@ Create or update the task list directly. You own it — changes are applied imme
 - You MUST create tasks within 1-2 turns maximum
 - Tasks should have clear objectives and testable acceptance criteria
 - Each task should be completable by a single developer in 30-60 minutes
-- You can also update or remove existing tasks that haven't started yet
+- **UPDATE OVER APPEND:** When the user's message refines, clarifies, or adds detail to work covered by an existing modifiable task, UPDATE that task (via updatedNodes) instead of creating a new one. Only create a new task if the work is genuinely separate from all existing tasks. Check the "Modifiable tasks" list in the system context — if a task already covers the same area of work, update it.
 - Creating tasks does NOT end the conversation — you keep chatting about refinements
 
 ### gather_info
@@ -165,6 +178,7 @@ Rules:
 - Default to create_tasks. Err aggressively on the side of creating tasks early.
 - EXCEPTION: For architectural/extension proposals about the platform itself, default to gather_info with research=true first.
 - Task IDs should be "task-1", "task-2", etc. for new tasks.
+- NEVER create a task that duplicates or overlaps with an existing task (including done or active tasks). Check the "Completed tasks", "Currently working on", and "Modifiable tasks" context before creating new ones. If the user's refinement relates to an existing modifiable task, use updatedNodes to update it — do NOT append a new task.
 - For backend tasks, acceptance criteria should specify exact API endpoint paths
 - For frontend tasks, acceptance criteria should specify exact page routes
 - For semantic tasks, reference available services (LLM-based analysis) not regex/keyword lists`;
@@ -441,12 +455,27 @@ export class DialogueAgent {
                 isAtomic: true,
             }));
 
-            try {
-                appendNodes(this.taskGraph, newTaskNodes);
-                logger.info(`[DialogueAgent:${this.traceId}] Added ${newTaskNodes.length.toString()} new nodes`);
-            } catch (err) {
-                const msg = err instanceof Error ? err.message : String(err);
-                logger.warn(`[DialogueAgent:${this.traceId}] Append nodes failed: ${msg}`);
+            // Filter out near-duplicates of existing tasks (especially done/active)
+            const existingObjectives = this.taskGraph.nodes.map((n) => n.objective.toLowerCase());
+            const dedupedNodes = newTaskNodes.filter((n) => {
+                const newObj = n.objective.toLowerCase();
+                const isDuplicate = existingObjectives.some((existing) =>
+                    existing.includes(newObj) || newObj.includes(existing),
+                );
+                if (isDuplicate) {
+                    logger.warn(`[DialogueAgent:${this.traceId}] Rejected duplicate task: "${n.objective}"`);
+                }
+                return !isDuplicate;
+            });
+
+            if (dedupedNodes.length > 0) {
+                try {
+                    appendNodes(this.taskGraph, dedupedNodes);
+                    logger.info(`[DialogueAgent:${this.traceId}] Added ${dedupedNodes.length.toString()} new nodes`);
+                } catch (err) {
+                    const msg = err instanceof Error ? err.message : String(err);
+                    logger.warn(`[DialogueAgent:${this.traceId}] Append nodes failed: ${msg}`);
+                }
             }
         }
 
@@ -694,6 +723,24 @@ export class DialogueAgent {
         }
     }
 
+    /**
+     * Clean up all resources on session deletion.
+     * Removes event subscriptions and clears internal state so the
+     * FeatureDeveloper (if still running) won't pick up new tasks.
+     */
+    destroy(): void {
+        this.#cleanupFeatureDeveloperSubscriptions();
+        // Clear the task graph so a still-running FeatureDeveloper's
+        // while-loop exits (no ready nodes left to find)
+        if (this.taskGraph !== null) {
+            this.taskGraph.nodes = [];
+            this.taskGraph.status = 'failed';
+        }
+        this.featureDeveloperId = null;
+        this.featureDeveloperDone = true;
+        logger.info(`[DialogueAgent:${this.traceId}] Cleaned up resources`);
+    }
+
     // ── Private helpers ──────────────────────────────────────────────────────
 
     #unlockAndEmit(): void {
@@ -778,6 +825,12 @@ export class DialogueAgent {
 
             if (active.length > 0) {
                 parts.push(`Currently working on: "${active[0]!.objective.slice(0, 100)}"`);
+            }
+
+            // Show completed tasks so the LLM doesn't create duplicates
+            if (done.length > 0) {
+                const doneList = done.map((n) => `${n.id}: "${n.objective.slice(0, 60)}"`).join('; ');
+                parts.push(`Completed tasks: ${doneList}`);
             }
 
             // Show mutable tasks so the LLM knows what can be updated
