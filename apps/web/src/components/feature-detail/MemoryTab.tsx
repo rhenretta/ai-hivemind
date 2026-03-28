@@ -351,7 +351,9 @@ function MemoryEntryCard({
                     )}
 
                     {/* Content */}
-                    {json !== null ? (
+                    {json !== null && typeof json['layout'] === 'string' ? (
+                        <UxDesignContent json={json} />
+                    ) : json !== null && typeof json['subtask'] === 'string' ? (
                         <SweArtifactContent json={json} />
                     ) : (
                         <pre className="text-xs text-foreground/80 whitespace-pre-wrap font-mono bg-background/50 rounded p-3 max-h-96 overflow-y-auto">
@@ -360,6 +362,37 @@ function MemoryEntryCard({
                     )}
                 </div>
             )}
+        </div>
+    );
+}
+
+// ── UX Design structured rendering ───────────────────────────────────────────
+
+function UxDesignContent({ json }: { json: Record<string, unknown> }) {
+    const layout = typeof json['layout'] === 'string' ? json['layout'] : null;
+    const components = typeof json['componentHierarchy'] === 'string' ? json['componentHierarchy'] : null;
+    const styling = typeof json['styling'] === 'string' ? json['styling'] : null;
+    const wireframe = typeof json['wireframe'] === 'string' ? json['wireframe'] : null;
+    const criteria = typeof json['uxAcceptanceCriteria'] === 'string' ? json['uxAcceptanceCriteria'] : null;
+
+    const sections = [
+        { label: 'Layout', content: layout },
+        { label: 'Components', content: components },
+        { label: 'Styling', content: styling },
+        { label: 'Wireframe', content: wireframe },
+        { label: 'UX Acceptance Criteria', content: criteria },
+    ].filter((s) => s.content !== null);
+
+    return (
+        <div className="space-y-3 mt-2">
+            {sections.map((s) => (
+                <div key={s.label}>
+                    <div className="text-[10px] uppercase text-violet-400/80 mb-1">{s.label}</div>
+                    <pre className="text-xs text-foreground/80 whitespace-pre-wrap font-mono bg-background/50 rounded p-2 max-h-48 overflow-y-auto">
+                        {s.content}
+                    </pre>
+                </div>
+            ))}
         </div>
     );
 }

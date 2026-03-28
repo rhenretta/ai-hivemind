@@ -50,7 +50,7 @@ const ROOT_FILES = [
 ];
 
 /** Exclusion patterns for tar (same as rsync excludes) */
-const TAR_EXCLUDES = ['node_modules', 'dist', '.next', '.turbo', '.cache', '.git'];
+const TAR_EXCLUDES = ['node_modules', 'dist', '.next', '.turbo', '.cache', '.git', '._*'];
 
 /** Patterns to skip when merging files back from container */
 const MERGE_SKIP = ['node_modules', 'dist', '.next', '.turbo', '.cache'];

@@ -168,7 +168,19 @@ export class QaBrowserSession {
         try {
             await this.#page.click(selector, { timeout: timeoutMs });
             logger.info(`[QaBrowser] Clicked: ${selector}`);
-            return `Clicked element: ${selector}`;
+
+            // Wait for any network activity triggered by the click to settle.
+            // Many clicks trigger async fetches (e.g. "next" button loads new data).
+            // Without this, the QA agent reads stale content before the fetch completes.
+            try {
+                await this.#page.waitForLoadState('networkidle', { timeout: 15_000 });
+            } catch {
+                // Non-fatal — if networkidle times out, the page is still usable.
+                // Static clicks (no network) resolve in <500ms so this doesn't slow them down.
+                logger.info(`[QaBrowser] networkidle wait after click timed out — continuing`);
+            }
+
+            return `Clicked element: ${selector}. Page network activity has settled.`;
         } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             logger.warn(`[QaBrowser] click failed on "${selector}": ${msg}`);
@@ -186,7 +198,16 @@ export class QaBrowserSession {
         try {
             await this.#page.fill(selector, value, { timeout: DEFAULT_INTERACTION_TIMEOUT });
             logger.info(`[QaBrowser] Filled "${selector}" with "${value.slice(0, 50)}"`);
-            return `Filled "${selector}" with "${value}"`;
+
+            // Wait for any network activity triggered by the fill to settle.
+            // Covers debounced search inputs, auto-submit forms, etc.
+            try {
+                await this.#page.waitForLoadState('networkidle', { timeout: 15_000 });
+            } catch {
+                logger.info(`[QaBrowser] networkidle wait after fill timed out — continuing`);
+            }
+
+            return `Filled "${selector}" with "${value}". Page network activity has settled.`;
         } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             logger.warn(`[QaBrowser] fill failed on "${selector}": ${msg}`);
@@ -268,6 +289,74 @@ export class QaBrowserSession {
             const msg = err instanceof Error ? err.message : String(err);
             logger.warn(`[QaBrowser] evaluate failed: ${msg}`);
             return `[BROWSER_ERROR] JavaScript evaluation failed: ${msg}`;
+        }
+    }
+
+    /**
+     * Navigate to a URL and return a structural summary of the page.
+     * Discovers interactive elements, containers, and visible text so the
+     * caller doesn't need to manually evaluate DOM structure.
+     */
+    async inspectPage(
+        url: string,
+        waitUntil: 'load' | 'networkidle' | 'domcontentloaded' = 'networkidle',
+    ): Promise<string> {
+        if (this.#page === null) return '[BROWSER_ERROR] Browser session not started.';
+
+        const navResult = await this.navigate(url, waitUntil);
+        if (navResult.startsWith('[BROWSER_ERROR]') || navResult.startsWith('[BLOCKED]')) {
+            return navResult;
+        }
+
+        try {
+            // The inspection script runs in the browser context (DOM APIs).
+            // Use evaluate(string) to avoid TS needing DOM lib types.
+            const inspectionScript = `(() => {
+                const title = document.title;
+                const bodyText = (document.body && document.body.innerText || '').slice(0, 2000);
+
+                function getSelector(el) {
+                    const id = el.id ? '#' + el.id : '';
+                    const cn = el.className && typeof el.className === 'string'
+                        ? '.' + el.className.split(' ').filter(Boolean).join('.') : '';
+                    return id || (el.tagName.toLowerCase() + cn);
+                }
+
+                const buttons = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]')).slice(0, 20).map(el => ({
+                    selector: getSelector(el),
+                    text: (el.innerText || '').trim().slice(0, 80) || el.getAttribute('aria-label') || ''
+                }));
+
+                const links = Array.from(document.querySelectorAll('a[href]')).slice(0, 20).map(el => ({
+                    selector: el.id ? '#' + el.id : 'a' + (el.className && typeof el.className === 'string' ? '.' + el.className.split(' ').filter(Boolean).join('.') : ''),
+                    text: (el.innerText || '').trim().slice(0, 80),
+                    href: el.getAttribute('href') || ''
+                }));
+
+                const inputs = Array.from(document.querySelectorAll('input, textarea, select')).slice(0, 20).map(el => ({
+                    selector: el.id ? '#' + el.id : el.tagName.toLowerCase() + (el.name ? '[name="' + el.name + '"]' : '') + (el.className && typeof el.className === 'string' ? '.' + el.className.split(' ').filter(Boolean).join('.') : ''),
+                    type: el.type || el.tagName.toLowerCase(),
+                    placeholder: el.placeholder || ''
+                }));
+
+                const containers = Array.from(document.querySelectorAll('main, section, article, nav, header, footer, [role="main"], [role="navigation"]')).slice(0, 15).map(el => ({
+                    selector: getSelector(el),
+                    tag: el.tagName.toLowerCase(),
+                    childCount: el.children.length
+                }));
+
+                const hasSpinner = document.querySelector('[class*="loading"], [class*="spinner"], [class*="skeleton"], [role="progressbar"]') !== null;
+
+                return { title, bodyText, buttons, links, inputs, containers, hasSpinner };
+            })()`;
+
+            const result = await this.evaluate(inspectionScript);
+            logger.info(`[QaBrowser] inspectPage: ${url} (${result.length.toString()} chars)`);
+            return result;
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            logger.warn(`[QaBrowser] inspectPage failed: ${msg}`);
+            return `[BROWSER_ERROR] Page inspection failed: ${msg}`;
         }
     }
 
