@@ -19,7 +19,6 @@ import { eventBus } from '../eventBus.js';
 import { getFeatureSummaries } from './intentRouter.js';
 import { generateWithRawTools, extractTextContent, extractToolCalls, type LLMMessage, type LLMToolCall } from './llm.js';
 import { logger } from './logger.js';
-import { executeTool } from './mcpExecutor.js';
 import { ragStore } from './ragStore.js';
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -82,29 +81,11 @@ Given a user message and the current feature ID, decide what context the convers
 - For QA/testing questions ("did it pass?", "any bugs?"): use get_qa_results
 - For design/UX questions ("what will it look like?", "layout?"): use get_design_spec
 - For questions about other features: use get_all_features
-- For codebase questions ("what's in this file?", "how does X work?"): use query_codebase
-- For technical detail questions: use query_knowledge_base
+- For codebase or technical detail questions: use query_knowledge_base to search research findings and SWE outputs
 - Keep your final context summary CONCISE — under 500 words
 - Do NOT include information the user didn't ask about
 - Always include the current phase and overall status if work is in progress
 - If no tools are needed (e.g., casual greeting), respond with just a brief status note
-
-## CRITICAL: New Feature Proposals & Architectural Discussions
-When the user proposes a NEW feature, wants to rethink/extend/redesign existing functionality, or references platform concepts by name (e.g., "feature developer", "sandbox", "agents", "conductor", "QA engineer", "dialogue agent"), you MUST proactively use query_codebase:
-- First use shell_command with "find apps/backend/src -name '*.ts' | head -40" or "ls apps/backend/src/agents/" to discover the project layout
-- Then use read_file on the specific source files relevant to the user's proposal
-- Focus on: public API surface, system prompts, key data flows, and integration points
-- This is NOT optional — architectural proposals without codebase grounding produce shallow context
-
-IMPORTANT search rules:
-- NEVER grep the entire repo recursively (e.g., "grep -r 'agent' ./") — this returns too much data
-- ALWAYS exclude node_modules and dist: use "--exclude-dir=node_modules --exclude-dir=dist"
-- Prefer "grep -rl" (files-only) over "grep -r" (full content) to find files first
-- Prefer "find" + "read_file" over broad grep — find the file, then read it
-- Target specific directories: apps/backend/src/, apps/web/src/, packages/shared/src/
-- Search for specific class/function names (e.g., "FeatureDeveloper", "SandboxManager"), NOT natural language phrases from the user's message
-
-Even if no existing feature work has started (empty task graph, no phase), a new proposal about the platform itself always warrants codebase queries.
 
 ## Response Format
 After gathering information, provide a concise context summary as plain text. This will be injected into the conversation as system context — the user won't see it directly.`;
@@ -179,26 +160,6 @@ const CONTEXT_TOOLS: OpenAI.ChatCompletionTool[] = [
     {
         type: 'function',
         function: {
-            name: 'query_codebase',
-            description: 'Read a file from the project or run a read-only shell command to inspect the codebase (e.g., ls, find, grep). Use this when the user asks about the project structure or specific files.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    action: {
-                        type: 'string',
-                        enum: ['read_file', 'shell_command'],
-                        description: 'Whether to read a specific file or run a shell command.',
-                    },
-                    path: { type: 'string', description: 'File path (for read_file action).' },
-                    command: { type: 'string', description: 'Shell command (for shell_command action). Must be read-only (ls, find, grep, cat, wc, etc.).' },
-                },
-                required: ['action'],
-            },
-        },
-    },
-    {
-        type: 'function',
-        function: {
             name: 'query_knowledge_base',
             description: 'Search the RAG knowledge base for research findings, SWE build outputs, or UX designs. Use "all" to search across all collections for a given feature.',
             parameters: {
@@ -217,10 +178,6 @@ const CONTEXT_TOOLS: OpenAI.ChatCompletionTool[] = [
         },
     },
 ];
-
-// ── Blocked commands for safety ──────────────────────────────────────────────
-
-const BLOCKED_COMMANDS = ['rm ', 'mv ', 'cp ', 'write', 'mkdir', 'touch', '>', '>>', 'chmod', 'chown', 'sudo'];
 
 // ── ContextAgent class ───────────────────────────────────────────────────────
 
@@ -293,20 +250,11 @@ class ContextAgent {
                 }
             }
 
-            // Signal to the LLM that this is a new/fresh feature with no prior context
-            let featureMaturity = '';
-            if (traceId !== null) {
-                const ctx = this.#features.get(traceId);
-                if (ctx === undefined || (ctx.taskGraph === null && ctx.currentPhase === null)) {
-                    featureMaturity = '\nThis is a NEW feature with no existing work — if the user is proposing architectural changes or referencing platform components, use query_codebase to understand the current implementation.';
-                }
-            }
-
             const messages: LLMMessage[] = [
                 { role: 'system', content: CONTEXT_SYSTEM_PROMPT },
                 {
                     role: 'user',
-                    content: `${featureNote}${quickStatus}${featureMaturity}\n\nUser message: "${userMessage}"\n\nGather the relevant context.`,
+                    content: `${featureNote}${quickStatus}\n\nUser message: "${userMessage}"\n\nGather the relevant context.`,
                 },
             ];
 
@@ -587,23 +535,6 @@ class ContextAgent {
                     }
                 }
                 return parts.length > 0 ? parts.join('\n') : 'No execution activity recorded yet.';
-            }
-
-            case 'query_codebase': {
-                const action = String(args['action'] ?? '');
-                if (action === 'read_file') {
-                    const path = String(args['path'] ?? '');
-                    return await executeTool('read_file', { path });
-                }
-                if (action === 'shell_command') {
-                    const command = String(args['command'] ?? '');
-                    // Safety: enforce read-only by blocking writes
-                    if (BLOCKED_COMMANDS.some((b) => command.includes(b))) {
-                        return 'ERROR: Only read-only commands are allowed (ls, find, grep, cat, wc, etc.)';
-                    }
-                    return await executeTool('execute_cli_command', { command, timeout_ms: 8000 });
-                }
-                return 'ERROR: action must be "read_file" or "shell_command"';
             }
 
             case 'query_knowledge_base': {
