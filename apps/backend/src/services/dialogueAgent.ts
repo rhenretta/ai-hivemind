@@ -118,13 +118,13 @@ You are the planning brain of the team. You:
 
 ## Actions You Can Take
 
-### create_tasks (DEFAULT — almost every message should create or update tasks)
-Create or update the task list directly. You own it — changes are applied immediately.
-- If the user describes ANYTHING concrete, create tasks IMMEDIATELY — even on the first message
-- You MUST create tasks within 1-2 turns maximum
-- Tasks should have clear objectives and testable acceptance criteria
-- Each task should be completable by a single developer in 30-60 minutes
-- **UPDATE OVER APPEND:** When the user's message refines, clarifies, or adds detail to work covered by an existing modifiable task, UPDATE that task (via updatedNodes) instead of creating a new one. Only create a new task if the work is genuinely separate from all existing tasks. Check the "Modifiable tasks" list in the system context — if a task already covers the same area of work, update it.
+### create_tasks
+Create or update the task list. You own it — changes are applied immediately.
+- On the FIRST concrete feature request, create tasks immediately so the team can start building
+- Keep initial tasks broad — most features need 2-4 tasks, not 7+
+- After the initial creation, your job shifts to REFINEMENT: update existing tasks with better
+  acceptance criteria as the user clarifies requirements. Use updatedNodes to refine tasks that
+  already exist. Only add a genuinely new task if the user requests something no existing task covers.
 - Creating tasks does NOT end the conversation — you keep chatting about refinements
 
 ### gather_info
@@ -345,7 +345,7 @@ export class DialogueAgent {
             this.#unlockAndEmit();
 
             // Auto-start FeatureDeveloper if we have ready tasks and none running
-            this.#maybeStartFeatureDeveloper();
+            void this.#maybeStartFeatureDeveloper();
 
             // Store assistant response in history
             this.history.push({ role: 'assistant', content: JSON.stringify(action) });
@@ -455,23 +455,20 @@ export class DialogueAgent {
                 isAtomic: true,
             }));
 
-            // Filter out near-duplicates of existing tasks (especially done/active)
-            const existingObjectives = this.taskGraph.nodes.map((n) => n.objective.toLowerCase());
-            const dedupedNodes = newTaskNodes.filter((n) => {
-                const newObj = n.objective.toLowerCase();
-                const isDuplicate = existingObjectives.some((existing) =>
-                    existing.includes(newObj) || newObj.includes(existing),
-                );
-                if (isDuplicate) {
-                    logger.warn(`[DialogueAgent:${this.traceId}] Rejected duplicate task: "${n.objective}"`);
+            // Reject new tasks that have the exact same ID as an existing task
+            const existingIds = new Set(this.taskGraph.nodes.map((n) => n.id));
+            const uniqueNodes = newTaskNodes.filter((n) => {
+                if (existingIds.has(n.id)) {
+                    logger.warn(`[DialogueAgent:${this.traceId}] Rejected task with duplicate ID: "${n.id}"`);
+                    return false;
                 }
-                return !isDuplicate;
+                return true;
             });
 
-            if (dedupedNodes.length > 0) {
+            if (uniqueNodes.length > 0) {
                 try {
-                    appendNodes(this.taskGraph, dedupedNodes);
-                    logger.info(`[DialogueAgent:${this.traceId}] Added ${dedupedNodes.length.toString()} new nodes`);
+                    appendNodes(this.taskGraph, uniqueNodes);
+                    logger.info(`[DialogueAgent:${this.traceId}] Added ${uniqueNodes.length.toString()} new nodes`);
                 } catch (err) {
                     const msg = err instanceof Error ? err.message : String(err);
                     logger.warn(`[DialogueAgent:${this.traceId}] Append nodes failed: ${msg}`);
@@ -628,9 +625,51 @@ export class DialogueAgent {
         }
     }
 
+    // ── Auto-gather for frontend work ───────────────────────────────────────
+
+    async #autoGatherForFrontend(): Promise<void> {
+        const objective = this.workObjective
+            ?? this.taskGraph?.rootObjective
+            ?? 'feature exploration';
+
+        // 1. Research — understand existing codebase patterns
+        if (this.researchSummary === null) {
+            try {
+                const sandbox = await this.#ensureSandbox();
+                this.#emitResponse('Researching the codebase for relevant context...');
+                const researcherId = `data-researcher.${uuidv4().slice(0, 8)}`;
+                const researcher = new DataResearcher(researcherId, this.traceId);
+                const result = await researcher.run(objective, sandbox);
+                this.researchSummary = result.summary;
+                contextAgent.setResearchSummary(this.traceId, result.summary);
+                logger.info(`[DialogueAgent:${this.traceId}] Auto-research completed: ${result.summary.slice(0, 100)}`);
+            } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                logger.warn(`[DialogueAgent:${this.traceId}] Auto-research failed: ${msg}`);
+            }
+        }
+
+        // 2. Design — create UX design spec
+        try {
+            this.#emitResponse('Creating a UX design spec for this feature...');
+            const designerId = `ux-designer.${uuidv4().slice(0, 8)}`;
+            const designer = new UxDesigner(designerId, this.traceId);
+            this.designSpec = await designer.run(
+                objective,
+                this.researchSummary ?? 'No research context.',
+                this.siteExploration ?? undefined,
+            );
+            contextAgent.setDesignSpec(this.traceId, this.designSpec);
+            logger.info(`[DialogueAgent:${this.traceId}] Auto-design completed`);
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            logger.warn(`[DialogueAgent:${this.traceId}] Auto-design failed: ${msg}`);
+        }
+    }
+
     // ── FeatureDeveloper lifecycle ────────────────────────────────────────────
 
-    #maybeStartFeatureDeveloper(): void {
+    async #maybeStartFeatureDeveloper(): Promise<void> {
         if (this.taskGraph === null) return;
         if (this.featureDeveloperId !== null) return; // already running
 
@@ -638,9 +677,19 @@ export class DialogueAgent {
         const hasReady = this.taskGraph.nodes.some((n) => n.status === 'ready');
         if (!hasReady) return;
 
+        // Claim the slot immediately to prevent duplicate spawns during async gather
         const devId = `feature-developer.${uuidv4().slice(0, 8)}`;
         this.featureDeveloperId = devId;
         this.featureDeveloperDone = false;
+
+        // Auto-gather research + design if ANY node involves frontend work
+        // (not just ready nodes — pending frontend tasks will need the design spec later)
+        const hasFrontendWork = this.taskGraph.nodes.some(
+            (n) => n.taskType === 'frontend' || n.taskType === 'fullstack',
+        );
+        if (hasFrontendWork && this.designSpec === null) {
+            await this.#autoGatherForFrontend();
+        }
 
         const context: FeatureDevContext = {
             taskGraph: this.taskGraph,
@@ -823,21 +872,20 @@ export class DialogueAgent {
                 `Task graph: ${done.length.toString()} done, ${active.length.toString()} active, ${ready.length.toString()} ready, ${pending.length.toString()} pending, ${locked.length.toString()} locked.`,
             );
 
-            if (active.length > 0) {
-                parts.push(`Currently working on: "${active[0]!.objective.slice(0, 100)}"`);
+            // Show immutable tasks (done/active) — cannot be changed
+            const immutable = [...done, ...active];
+            if (immutable.length > 0) {
+                const immutableList = immutable.map((n) => `[${n.status}] ${n.id}: "${n.objective.slice(0, 80)}"`).join('; ');
+                parts.push(`Locked (done/active, do NOT modify): ${immutableList}`);
             }
 
-            // Show completed tasks so the LLM doesn't create duplicates
-            if (done.length > 0) {
-                const doneList = done.map((n) => `${n.id}: "${n.objective.slice(0, 60)}"`).join('; ');
-                parts.push(`Completed tasks: ${doneList}`);
-            }
-
-            // Show mutable tasks so the LLM knows what can be updated
+            // Show mutable tasks with full detail so the LLM can decide what to update
             const mutable = [...ready, ...pending, ...locked];
             if (mutable.length > 0) {
-                const mutableList = mutable.map((n) => `${n.id}: "${n.objective.slice(0, 60)}"`).join('; ');
-                parts.push(`Modifiable tasks: ${mutableList}`);
+                const mutableList = mutable.map((n) =>
+                    `${n.id}: "${n.objective}" (criteria: ${n.acceptanceCriteria.slice(0, 120)})`,
+                ).join('\n  ');
+                parts.push(`Modifiable tasks (update these via updatedNodes when refining):\n  ${mutableList}`);
             }
         }
 
