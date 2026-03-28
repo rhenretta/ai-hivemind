@@ -262,6 +262,15 @@ export class FeatureDeveloper extends BaseAgent {
                     if (url !== undefined) deployedServiceUrl = url;
                 });
 
+                // Capture the conductor's final result summary
+                let conductorSummaryText = '';
+                const unsubStateChanged = eventBus.subscribe('STATE_CHANGED', (event: SystemEvent) => {
+                    if (event.sourceId !== sweId) return;
+                    if (event.payload['source'] === 'conductor:result' && typeof event.payload['message'] === 'string') {
+                        conductorSummaryText = event.payload['message'];
+                    }
+                });
+
                 // Track files changed by the conductor
                 const trackedFiles = new Set<string>();
                 const trackedCommands: string[] = [];
@@ -317,8 +326,28 @@ export class FeatureDeveloper extends BaseAgent {
                         filesChanged: [...trackedFiles],
                         commandsRun: trackedCommands,
                         success: true,
+                        // Prefer the conductor's live result over RAG (which may be empty in sandbox flow)
+                        ...(conductorSummaryText ? { summary: conductorSummaryText } : {}),
                     };
                     logger.info(`[${this.agentId}] Artifact: ${trackedFiles.size.toString()} files changed, ${trackedCommands.length.toString()} commands run`);
+
+                    // Store artifact in RAG so it appears in Memory tab
+                    try {
+                        const collections = ragStore.getCollections();
+                        if (!collections.some((c) => c.name === SoftwareEngineer.RAG_COLLECTION)) {
+                            ragStore.createCollection(SoftwareEngineer.RAG_COLLECTION, 'Structured SweArtifact outputs from SWE agent Claude Code runs');
+                        }
+                        ragStore.storeContext(SoftwareEngineer.RAG_COLLECTION, {
+                            memoryId: crypto.randomUUID(),
+                            traceId: this.traceId,
+                            agentId: sweId,
+                            content: `[${artifact.success ? 'SUCCESS' : 'FAILED'}] ${sweId}\n${JSON.stringify(artifact)}`,
+                            tags: ['swe', 'conductor', artifact.success ? 'success' : 'failed', 'phase:implement'],
+                            timestamp: new Date().toISOString(),
+                        });
+                    } catch (ragErr) {
+                        logger.warn(`[${this.agentId}] Failed to store SWE artifact in RAG:`, ragErr);
+                    }
 
                     saveState({
                         traceId: this.traceId,
@@ -351,6 +380,7 @@ export class FeatureDeveloper extends BaseAgent {
                 } finally {
                     unsubDeployed();
                     unsubToolUsed();
+                    unsubStateChanged();
                     conductorRef.abort();
                 }
 
@@ -367,7 +397,7 @@ export class FeatureDeveloper extends BaseAgent {
 
                 // Validate via QA
                 const qaId = `qa-engineer.${uuidv4().slice(0, 8)}`;
-                const qa = new QaEngineer(qaId, this.traceId);
+                const qa = new QaEngineer(qaId, this.traceId, this.agentId);
                 const verdict = await qa.run(node.objective, node.acceptanceCriteria, artifact, deployedServiceUrl, sandbox, designSpec, graph, priorIssues.length > 0 ? priorIssues : undefined);
 
                 if (verdict.passed) {
